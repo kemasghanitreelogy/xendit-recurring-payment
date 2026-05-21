@@ -1,0 +1,44 @@
+{% comment %}
+  Snippet: subscribe-button
+  Renders a Subscribe button that routes through Shopify App Proxy
+  to the Xendit recurring bridge backend.
+
+  Usage in a section/template:
+    {% render 'subscribe-button', plan_code: 'pro_monthly', label: 'Subscribe Pro' %}
+
+  Requires App Proxy configured at /apps/xendit pointing to your backend.
+  When customer is logged in, Shopify injects logged_in_customer_id automatically.
+{% endcomment %}
+
+{% assign plan_code = plan_code | default: 'pro_monthly' %}
+{% assign label = label | default: 'Subscribe' %}
+{% assign proxy_base = '/apps/xendit' %}
+
+{% if customer %}
+  {% if customer.tags contains 'pro-member' %}
+    <a href="/account" class="btn btn--secondary subscribe-btn subscribe-btn--active">
+      ✓ Anda sudah subscribe
+    </a>
+  {% else %}
+    <a
+      href="{{ proxy_base }}/subscribe?plan_code={{ plan_code | url_encode }}"
+      class="btn btn--primary subscribe-btn"
+      data-plan="{{ plan_code }}"
+    >
+      {{ label }}
+    </a>
+  {% endif %}
+{% else %}
+  <a
+    href="/account/login?return_url={{ request.path | url_encode }}"
+    class="btn btn--primary subscribe-btn subscribe-btn--login"
+  >
+    Login untuk Subscribe
+  </a>
+{% endif %}
+
+<style>
+  .subscribe-btn { display: inline-block; padding: 12px 24px; border-radius: 8px;
+    font-weight: 600; text-decoration: none; }
+  .subscribe-btn--active { opacity: 0.7; pointer-events: none; }
+</style>

@@ -1,0 +1,119 @@
+{% comment %}
+  Snippet: customer-subscription
+  Renders the logged-in customer's subscription status + history.
+  Fetches data from the bridge backend via Shopify App Proxy.
+
+  Usage in customers/account.liquid:
+    {% render 'customer-subscription' %}
+
+  Requires App Proxy configured at /apps/xendit pointing to your backend.
+{% endcomment %}
+
+<div class="customer-subscription" id="customer-subscription">
+  <h2>Subscription</h2>
+  <div class="customer-subscription__loading">Memuat...</div>
+</div>
+
+<script>
+(function () {
+  var container = document.getElementById('customer-subscription');
+  if (!container) return;
+
+  function formatIDR(amount) {
+    return new Intl.NumberFormat('id-ID', {
+      style: 'currency', currency: 'IDR', minimumFractionDigits: 0,
+    }).format(amount);
+  }
+  function fmtDate(s) {
+    if (!s) return '—';
+    return new Date(s).toLocaleDateString('id-ID', {
+      day: 'numeric', month: 'long', year: 'numeric',
+    });
+  }
+  function escape(s) {
+    return String(s ?? '').replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
+  }
+
+  fetch('/apps/xendit/subscription/current', { credentials: 'same-origin' })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      var sub = data.subscription;
+      var invoices = data.invoices || [];
+
+      if (!sub) {
+        container.innerHTML =
+          '<h2>Subscription</h2>' +
+          '<p>Belum ada subscription aktif.</p>' +
+          '<a href="/products/pro-subscription" class="btn btn--primary">Lihat Paket</a>';
+        return;
+      }
+
+      var planName = (sub.metadata && sub.metadata.plan_name) || sub.plan_code;
+      var nextBilling = fmtDate(sub.current_period_end);
+      var intervalLabel = sub.interval === 'YEAR' ? 'tahun' : 'bulan';
+
+      var invoiceRows = invoices.map(function (inv) {
+        return (
+          '<tr>' +
+          '<td>' + escape(formatIDR(inv.amount)) + '</td>' +
+          '<td>' + escape(inv.payment_method || '—') + '</td>' +
+          '<td>' + escape(fmtDate(inv.paid_at || inv.created_at)) + '</td>' +
+          '<td>' + escape(inv.status) + '</td>' +
+          '<td>' + (inv.shopify_order_name
+            ? '<a href="/account/orders" target="_self">' + escape(inv.shopify_order_name) + '</a>'
+            : '—') + '</td>' +
+          '</tr>'
+        );
+      }).join('');
+
+      container.innerHTML =
+        '<h2>Subscription</h2>' +
+        '<div class="sub-card">' +
+        '  <div><strong>' + escape(planName) + '</strong> &middot; ' + escape(sub.status) + '</div>' +
+        '  <div>' + escape(formatIDR(sub.amount)) + ' / ' + intervalLabel + '</div>' +
+        '  <div>Tagihan berikutnya: ' + escape(nextBilling) + '</div>' +
+        '  ' + (sub.status === 'ACTIVE'
+            ? '<button id="cancel-sub-btn" class="btn">Batalkan</button>'
+            : '') +
+        '</div>' +
+        '<h3 style="margin-top:24px">Riwayat Pembayaran</h3>' +
+        (invoices.length
+          ? '<table class="invoices-table"><thead><tr>' +
+            '<th>Amount</th><th>Method</th><th>Tanggal</th><th>Status</th><th>Order</th>' +
+            '</tr></thead><tbody>' + invoiceRows + '</tbody></table>'
+          : '<p>Belum ada riwayat pembayaran.</p>');
+
+      var btn = document.getElementById('cancel-sub-btn');
+      if (btn) {
+        btn.addEventListener('click', function () {
+          if (!confirm('Yakin mau cancel subscription?')) return;
+          btn.disabled = true;
+          btn.textContent = 'Memproses...';
+          fetch('/apps/xendit/subscription/cancel', {
+            method: 'POST', credentials: 'same-origin',
+          })
+            .then(function (r) {
+              if (r.ok) { window.location.reload(); }
+              else { alert('Gagal cancel. Coba lagi.'); btn.disabled = false; }
+            });
+        });
+      }
+    })
+    .catch(function (err) {
+      console.error('subscription fetch failed', err);
+      container.innerHTML =
+        '<h2>Subscription</h2>' +
+        '<p>Gagal memuat data subscription. Coba refresh halaman.</p>';
+    });
+})();
+</script>
+
+<style>
+  .customer-subscription .sub-card { border: 1px solid #e5e7eb; padding: 16px;
+    border-radius: 12px; display: grid; gap: 8px; }
+  .invoices-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .invoices-table th, .invoices-table td { padding: 8px; border-bottom: 1px solid #f3f4f6;
+    text-align: left; font-size: 14px; }
+</style>
