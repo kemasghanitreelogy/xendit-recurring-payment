@@ -168,8 +168,10 @@ git push -u origin main
 ### 5.2 Connect Vercel
 1. [vercel.com/new](https://vercel.com/new) → Import Git Repository
 2. Framework Preset: Next.js (auto-detected)
-3. Environment Variables: add semua dari `.env.local`:
-   - `XENDIT_SECRET_KEY`
+3. Environment Variables — **set semua untuk Production environment**:
+
+   **Required:**
+   - `XENDIT_SECRET_KEY` (production key `xnd_production_...`)
    - `XENDIT_WEBHOOK_TOKEN`
    - `XENDIT_API_URL` = `https://api.xendit.co`
    - `NEXT_PUBLIC_SUPABASE_URL`
@@ -178,14 +180,34 @@ git push -u origin main
    - `SHOPIFY_ADMIN_TOKEN`
    - `SHOPIFY_APP_PROXY_SECRET`
    - `SHOPIFY_API_VERSION` = `2024-10`
-   - `NEXT_PUBLIC_APP_URL` = `https://your-project.vercel.app`
-   - `ADMIN_RECONCILE_TOKEN` = `<generate openssl rand -hex 32>`
+   - `NEXT_PUBLIC_APP_URL` = **`https://your-project.vercel.app`** ⚠️
+     (kalau lupa update dari `localhost:3000`, customer setelah bayar nyangkut. App akan throw error di production kalau ada `localhost` di URL ini.)
+   - `ADMIN_RECONCILE_TOKEN` = `openssl rand -hex 32`
+
+   **Required untuk Cron + Alerting (production):**
+   - `CRON_SECRET` = `openssl rand -hex 32` (Vercel inject otomatis ke `/api/admin/reconcile/cron`)
+   - `ALERT_WEBHOOK_URL` = Slack/Discord incoming webhook URL untuk alert webhook failures
 4. Deploy
+
+> 💡 **Vercel Cron** sudah dikonfigurasi di `vercel.json` — auto-trigger `/api/admin/reconcile/cron` setiap 15 menit untuk retry Shopify sync failures + cleanup reservation row yang stale > 24 jam. Tanpa `CRON_SECRET`, endpoint return 503.
 
 ### 5.3 Update Webhook URL + App Proxy URL
 Setelah deploy berhasil, balik ke:
 - **Xendit Webhook**: update URL ke `https://your-project.vercel.app/api/webhook/xendit`
 - **Shopify App Proxy**: update Proxy URL ke `https://your-project.vercel.app/api`
+
+### 5.4 (Recommended) IP allowlist webhook
+Xendit publikasi IP webhook mereka. Di Vercel Project Settings → **Firewall**, tambahkan custom rule yang block traffic ke `/api/webhook/xendit` dari IP selain Xendit. Ini lapis kedua di atas `XENDIT_WEBHOOK_TOKEN` — kalau token leak, IP allowlist masih nge-block penyerang.
+
+Daftar IP terkini: lihat [Xendit Webhook IPs](https://docs.xendit.co/xendit-api/api-changelog/webhook-ips) atau hubungi Xendit support.
+
+### 5.5 (Recommended) Smoke test dengan dev key terlebih dahulu
+Sebelum pakai `xnd_production_...`:
+1. Generate `xnd_development_...` key di Xendit dashboard
+2. Set di Vercel **Preview** environment (bukan Production)
+3. Deploy preview, lalu test pakai test card: `4000 0000 0000 0002`, CVV `123`, OTP `112233`
+4. Verify webhook flow Active → Cycle.succeeded → Shopify order created → tag applied
+5. Setelah preview pass, baru flip Production env ke production key
 
 ---
 

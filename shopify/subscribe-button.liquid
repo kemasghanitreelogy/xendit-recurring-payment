@@ -15,7 +15,12 @@
 {% assign proxy_base = '/apps/xendit' %}
 
 {% if customer %}
-  {% if customer.tags contains 'pro-member' %}
+  {% comment %}
+    `subscriber` is the universal tag added for any paid plan. For tier-
+    specific gating use `pro-member` / `business-member`, or check the
+    exact plan with `plan-${planCode}` (e.g. `plan-business_yearly`).
+  {% endcomment %}
+  {% if customer.tags contains 'subscriber' %}
     <a href="/account" class="btn btn--secondary subscribe-btn subscribe-btn--active">
       ✓ Anda sudah subscribe
     </a>

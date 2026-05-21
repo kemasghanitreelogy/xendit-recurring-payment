@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { env } from './env';
 
 // ============================================================
 // Shopify App Proxy HMAC verification
@@ -16,12 +17,6 @@ import crypto from 'node:crypto';
 //   4. HMAC-SHA256 with the shared secret, hex-encoded.
 //   5. Constant-time compare with the `signature` value.
 // ============================================================
-
-const SECRET = process.env.SHOPIFY_APP_PROXY_SECRET!;
-
-if (!SECRET) {
-  throw new Error('SHOPIFY_APP_PROXY_SECRET is not set');
-}
 
 export type AppProxyContext = {
   shopifyCustomerId: string | null;
@@ -53,7 +48,7 @@ export function verifyAppProxy(searchParams: URLSearchParams): AppProxyContext |
   const message = entries.map(([k, v]) => `${k}=${v}`).join('');
 
   const computed = crypto
-    .createHmac('sha256', SECRET)
+    .createHmac('sha256', env.SHOPIFY_APP_PROXY_SECRET)
     .update(message)
     .digest('hex');
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/admin/reconcile/cron",
+      "schedule": "*/15 * * * *"
+    }
+  ],
+  "functions": {
+    "app/api/webhook/xendit/route.ts": {
+      "maxDuration": 30
+    },
+    "app/api/admin/reconcile/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/admin/reconcile/cron/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}

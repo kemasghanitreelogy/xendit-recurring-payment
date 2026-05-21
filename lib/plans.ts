@@ -81,3 +81,15 @@ export function formatIDR(amount: number): string {
     minimumFractionDigits: 0,
   }).format(amount);
 }
+
+// All tags a subscriber should carry while their sub is active. Order matters
+// for Liquid readability but is not semantically significant. Caller adds /
+// removes the whole set together.
+//
+// `subscriber` is the universal flag (any paid plan); `${tier}-member` lets
+// Liquid gate tier-specific content (e.g. only Business plan unlocks).
+export function membershipTagsForPlan(planCode: string): string[] {
+  // Derive tier from the plan code prefix (`pro_*` → `pro`, `business_*` → `business`).
+  const tier = planCode.split('_')[0];
+  return ['subscriber', `${tier}-member`, `plan-${planCode}`];
+}

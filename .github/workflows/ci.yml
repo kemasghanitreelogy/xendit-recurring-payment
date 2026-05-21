@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        # Dummy env so module-level reads don't fail. Real secrets are only
+        # needed at runtime, not at build. We supply syntactically valid
+        # placeholders so the env validator passes.
+        env:
+          XENDIT_SECRET_KEY: dummy_build_only
+          XENDIT_WEBHOOK_TOKEN: dummy_build_only
+          NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: dummy_build_only
+          SHOPIFY_STORE_DOMAIN: example.myshopify.com
+          SHOPIFY_ADMIN_TOKEN: dummy_build_only
+          SHOPIFY_APP_PROXY_SECRET: dummy_build_only
+          NEXT_PUBLIC_APP_URL: https://example.com
+          ADMIN_RECONCILE_TOKEN: dummy_build_only_token_long_enough_for_compare
+        run: npm run build

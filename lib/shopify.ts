@@ -12,15 +12,14 @@
 //   distinguish payment-provider errors from internal errors.
 // ============================================================
 
-const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
-const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN!;
-const API_VERSION = process.env.SHOPIFY_API_VERSION ?? '2024-10';
+import { env } from './env';
 
-if (!STORE) throw new Error('SHOPIFY_STORE_DOMAIN is not set');
-if (!TOKEN) throw new Error('SHOPIFY_ADMIN_TOKEN is not set');
-
-const REST_BASE = `https://${STORE}/admin/api/${API_VERSION}`;
-const GQL_URL = `https://${STORE}/admin/api/${API_VERSION}/graphql.json`;
+function restBase(): string {
+  return `https://${env.SHOPIFY_STORE_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}`;
+}
+function gqlUrl(): string {
+  return `https://${env.SHOPIFY_STORE_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}/graphql.json`;
+}
 
 export class ShopifyError extends Error {
   constructor(public status: number, public body: string) {
@@ -30,11 +29,11 @@ export class ShopifyError extends Error {
 }
 
 async function shopifyRest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${REST_BASE}${path}`, {
+  const res = await fetch(`${restBase()}${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': TOKEN,
+      'X-Shopify-Access-Token': env.SHOPIFY_ADMIN_TOKEN,
       ...init.headers,
     },
   });
@@ -44,11 +43,11 @@ async function shopifyRest<T>(path: string, init: RequestInit = {}): Promise<T> 
 }
 
 async function shopifyGql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-  const res = await fetch(GQL_URL, {
+  const res = await fetch(gqlUrl(), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': TOKEN,
+      'X-Shopify-Access-Token': env.SHOPIFY_ADMIN_TOKEN,
     },
     body: JSON.stringify({ query, variables }),
   });
@@ -84,12 +83,21 @@ type TagMutationResult = {
   userErrors: Array<{ field: string[] | null; message: string }>;
 };
 
+function toTagArray(tag: string | string[]): string[] {
+  return Array.isArray(tag) ? tag : [tag];
+}
+
 /**
- * Add a tag to a Shopify customer. Idempotent: adding a tag that
- * already exists is a no-op at Shopify's side. Throws ShopifyError
- * if Shopify returns userErrors (e.g. customer not found, invalid tag).
+ * Add one or more tags to a Shopify customer. Idempotent: adding a tag that
+ * already exists is a no-op at Shopify's side. Throws ShopifyError if Shopify
+ * returns userErrors (e.g. customer not found, invalid tag).
  */
-export async function addCustomerTag(customerId: string, tag: string): Promise<void> {
+export async function addCustomerTag(
+  customerId: string,
+  tag: string | string[],
+): Promise<void> {
+  const tags = toTagArray(tag);
+  if (tags.length === 0) return;
   const gid = `gid://shopify/Customer/${customerId}`;
   const data = await shopifyGql<{ tagsAdd: TagMutationResult }>(
     `mutation tagsAdd($id: ID!, $tags: [String!]!) {
@@ -97,14 +105,19 @@ export async function addCustomerTag(customerId: string, tag: string): Promise<v
         userErrors { field message }
       }
     }`,
-    { id: gid, tags: [tag] }
+    { id: gid, tags },
   );
   if (data.tagsAdd.userErrors.length) {
     throw new ShopifyError(200, JSON.stringify(data.tagsAdd.userErrors));
   }
 }
 
-export async function removeCustomerTag(customerId: string, tag: string): Promise<void> {
+export async function removeCustomerTag(
+  customerId: string,
+  tag: string | string[],
+): Promise<void> {
+  const tags = toTagArray(tag);
+  if (tags.length === 0) return;
   const gid = `gid://shopify/Customer/${customerId}`;
   const data = await shopifyGql<{ tagsRemove: TagMutationResult }>(
     `mutation tagsRemove($id: ID!, $tags: [String!]!) {
@@ -112,7 +125,7 @@ export async function removeCustomerTag(customerId: string, tag: string): Promis
         userErrors { field message }
       }
     }`,
-    { id: gid, tags: [tag] }
+    { id: gid, tags },
   );
   if (data.tagsRemove.userErrors.length) {
     throw new ShopifyError(200, JSON.stringify(data.tagsRemove.userErrors));
@@ -184,7 +197,8 @@ async function findOrderByXenditCycle(xenditCycleId: string): Promise<ShopifyOrd
         }
       }
     }`,
-    { q: `tag:"xendit_cycle_id=${xenditCycleId}"` }
+    // Shopify order tags can't contain '='; we tag as `xendit_cycle_${id}`.
+    { q: `tag:"xendit_cycle_${xenditCycleId}"` }
   );
 
   const node = data.orders.edges[0]?.node;
@@ -217,11 +231,14 @@ export async function createPaidOrder(input: CreateOrderInput): Promise<ShopifyO
 
   // 2. Build order payload
   const amountStr = input.amount.toString();          // IDR is integer; no decimals
+  // Shopify rejects tags containing '=' (HTTP 422 "Order tags is invalid"),
+  // so we use an underscore-prefixed format. The plan ID is also UUID-shaped
+  // which often pushes the combined tag over Shopify's 40-char limit, so we
+  // keep it in note_attributes only (where IDs of any length are allowed).
   const tags = [
     'xendit-recurring',
     `subscription-${input.planCode}`,
-    `xendit_cycle_id=${input.xenditCycleId}`,
-    `xendit_plan_id=${input.xenditPlanId}`,
+    `xendit_cycle_${input.xenditCycleId}`,
   ].join(', ');
 
   const noteAttributes = [

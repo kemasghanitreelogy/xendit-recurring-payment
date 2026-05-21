@@ -188,12 +188,12 @@ Semua endpoint pakai Node.js runtime (`runtime = 'nodejs'`) — bukan Edge.
 
 | Xendit Event | Trigger | DB Action | Shopify Action |
 |--------------|---------|-----------|----------------|
-| `recurring.plan.activated` | Plan aktif setelah first charge sukses | `status=ACTIVE`, set `current_period_*` | Add tag `pro-member` |
+| `recurring.plan.activated` | Plan aktif setelah first charge sukses | `status=ACTIVE`, set `current_period_*` | Add tags `subscriber`, `${tier}-member`, `plan-${plan_code}` |
 | `recurring.plan.inactivated` | Plan di-cancel (manual atau habis retry) | `status=CANCELED`, `canceled_at=now()` | Remove tag |
 | `recurring.cycle.created` | Cycle baru dibuat (sebelum charge) | Insert invoice `status=PENDING` | — |
-| `recurring.cycle.succeeded` | Charge sukses | Upsert invoice `SUCCEEDED`, refresh `period_end` | **Create paid Order** + refresh tag |
-| `recurring.cycle.retrying` | Charge gagal, akan retry (default 3x) | `status=PAST_DUE` | — (tag tetap, customer keep access) |
-| `recurring.cycle.failed` | Semua retry habis | `status=CANCELED`, invoice `FAILED` | Remove tag |
+| `recurring.cycle.succeeded` | Charge sukses | Upsert invoice `SUCCEEDED`, refresh `period_end` | **Create paid Order** + refresh tags |
+| `recurring.cycle.retrying` | Charge gagal, akan retry (default 3x) | `status=PAST_DUE` | — (tags tetap, customer keep access) |
+| `recurring.cycle.failed` | Semua retry habis | `status=CANCELED`, invoice `FAILED` | Remove tags |
 | `payment.succeeded` | Generic payment event | (ignored — overlap with `recurring.cycle.succeeded`) | — |
 | `payment.failed` | Generic payment event | (ignored — overlap with `recurring.cycle.failed`) | — |
 
@@ -370,7 +370,12 @@ Pakai test card Xendit: `4000 0000 0000 0002` (success), CVV `123`, exp future d
 A: Tidak. Card data tidak pernah menyentuh backend ini — customer input card langsung di Xendit hosted page. Xendit PCI-DSS Level 1 certified.
 
 **Q: Bagaimana cara kasih akses gated content di Shopify?**
-A: Pakai customer tag `pro-member` (di-add otomatis oleh backend). Di Liquid: `{% if customer.tags contains 'pro-member' %}<unlock content>{% endif %}`. Juga bisa dipakai untuk Shopify automatic discount rules.
+A: Backend auto-add 3 tag per subscriber (lihat `lib/plans.ts:membershipTagsForPlan`):
+- `subscriber` — universal, dipakai untuk gate apapun yang paid-only
+- `pro-member` / `business-member` — tier-based (derive dari prefix `plan_code`)
+- `plan-${plan_code}` — exact plan (e.g. `plan-business_yearly`) untuk discount rule per-tier
+
+Contoh Liquid: `{% if customer.tags contains 'business-member' %}<unlock business content>{% endif %}`
 
 **Q: Bisa kasih free trial?**
 A: Bisa. Tambah `trialDays?: number` di `lib/plans.ts` plan definition. Xendit akan mundurin first charge sesuai trial period, tapi customer tetap input payment method di awal.

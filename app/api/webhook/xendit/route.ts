@@ -1,4 +1,5 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
+import crypto from 'node:crypto';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { getRecurringPlan } from '@/lib/xendit';
 import {
@@ -7,19 +8,59 @@ import {
   createPaidOrder,
   ShopifyError,
 } from '@/lib/shopify';
+import { membershipTagsForPlan } from '@/lib/plans';
+import { env } from '@/lib/env';
+import { log, alert } from '@/lib/logger';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const MEMBER_TAG = 'pro-member';
-
+// ============================================================
+// Payload schema (typed extraction, no external deps)
+// ============================================================
 type WebhookEvent = {
   id?: string;
   event?: string;
   created?: string;
   business_id?: string;
-  data?: any;
+  data?: Record<string, unknown>;
 };
+
+type EventData = {
+  id?: string;                // plan ID for recurring.plan.*, cycle ID for recurring.cycle.*
+  recurring_plan_id?: string; // cycle.* events carry the plan ID here
+  customer_id?: string;
+  amount?: number;
+  currency?: string;
+  cycle_date?: string;
+  next_cycle_date?: string;
+  payment_method?: { type?: string };
+  channel_code?: string;
+  payment_id?: string;
+  failure_code?: string;
+  failure_reason?: string;
+  schedule?: { next_execution_at?: string };
+};
+
+function parseEvent(raw: unknown): WebhookEvent | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    id: typeof r.id === 'string' ? r.id : undefined,
+    event: typeof r.event === 'string' ? r.event : undefined,
+    created: typeof r.created === 'string' ? r.created : undefined,
+    business_id: typeof r.business_id === 'string' ? r.business_id : undefined,
+    data:
+      typeof r.data === 'object' && r.data !== null
+        ? (r.data as Record<string, unknown>)
+        : undefined,
+  };
+}
+
+function asData(d: Record<string, unknown> | undefined): EventData {
+  if (!d) return {};
+  return d as EventData;
+}
 
 type Admin = ReturnType<typeof createAdminClient>;
 
@@ -27,7 +68,7 @@ type Admin = ReturnType<typeof createAdminClient>;
  * Xendit webhook handler.
  *
  * Order of operations is critical:
- *   1. Verify token. Reject anything unsigned.
+ *   1. Verify token (constant-time compare).
  *   2. Dedupe via xendit_webhook_events PK (idempotent).
  *   3. Update DB state (single source of truth) BEFORE any external call.
  *   4. Attempt external sync (Shopify). Failures are caught and recorded
@@ -36,17 +77,32 @@ type Admin = ReturnType<typeof createAdminClient>;
  *   5. Mark webhook event as processed.
  */
 export async function POST(req: Request) {
-  // 1. Token verification
-  const token = req.headers.get('x-callback-token');
-  if (!token || token !== process.env.XENDIT_WEBHOOK_TOKEN) {
-    console.warn('[xendit-webhook] Invalid token');
+  // 1. Constant-time token verification — prevents timing-based brute force.
+  const provided = req.headers.get('x-callback-token') ?? '';
+  const expected = env.XENDIT_WEBHOOK_TOKEN;
+  const tokenOk =
+    provided.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+  if (!tokenOk) {
+    log.warn('webhook.invalid_token');
     return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
   }
 
-  const event: WebhookEvent = await req.json();
+  let rawBody: unknown;
+  try {
+    rawBody = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
+
+  const event = parseEvent(rawBody);
+  if (!event) {
+    return NextResponse.json({ error: 'Invalid payload shape' }, { status: 400 });
+  }
+
+  const data = asData(event.data);
   const eventId =
-    event.id ??
-    `${event.event}-${event.data?.id ?? 'unknown'}-${event.created ?? Date.now()}`;
+    event.id ?? `${event.event}-${data.id ?? 'unknown'}-${event.created ?? Date.now()}`;
   const eventType = event.event ?? 'unknown';
 
   const admin = createAdminClient();
@@ -54,19 +110,19 @@ export async function POST(req: Request) {
   // 2. Dedupe — insert into xendit_webhook_events; PK collision = duplicate
   const { error: dedupeErr } = await admin
     .from('xendit_webhook_events')
-    .insert({ id: eventId, event_type: eventType, payload: event as any });
+    .insert({ id: eventId, event_type: eventType, payload: event });
 
   if (dedupeErr) {
     if (dedupeErr.code === '23505') {
       return NextResponse.json({ ok: true, duplicate: true });
     }
-    console.error('[xendit-webhook] Dedupe error:', dedupeErr);
+    log.error('webhook.dedupe_failed', { eventId, eventType, error: dedupeErr.message });
     return NextResponse.json({ error: 'Storage error' }, { status: 500 });
   }
 
   // 3-4. Process the event
   try {
-    await handleEvent(eventType, event.data ?? {}, admin);
+    await handleEvent(eventType, data, admin);
     await admin
       .from('xendit_webhook_events')
       .update({ processed_at: new Date().toISOString() })
@@ -74,48 +130,60 @@ export async function POST(req: Request) {
   } catch (err) {
     // Critical handler failure (NOT just Shopify sync — Shopify failures
     // are caught inside handleEvent and recorded on the invoice). Still
-    // return 200 so Xendit doesn't endlessly retry; the error is logged
-    // for reconciliation.
-    console.error('[xendit-webhook] Handler error:', err);
+    // return 200 so Xendit doesn't endlessly retry; the error is recorded
+    // for reconciliation AND we fire an alert so a human notices.
+    const message = String(err).slice(0, 1000);
+    log.error('webhook.handler_failed', { eventId, eventType, error: message });
     await admin
       .from('xendit_webhook_events')
-      .update({ error: String(err) })
+      .update({ error: message })
       .eq('id', eventId);
+    after(() => alert('Xendit webhook handler crashed', { eventId, eventType, error: message }));
     return NextResponse.json({ ok: false, error: 'Processing failed' });
   }
 
   return NextResponse.json({ ok: true });
 }
 
-async function handleEvent(type: string, data: any, admin: Admin): Promise<void> {
+type SubscriptionRow = {
+  id: string;
+  status: string;
+  plan_code: string;
+  amount: number;
+  currency: string;
+  shopify_customer_id: string;
+  shopify_customer_email: string;
+  xendit_plan_id: string;
+  metadata: { plan_name?: string; shop_domain?: string } | null;
+};
+
+async function handleEvent(type: string, data: EventData, admin: Admin): Promise<void> {
   // Per Xendit payload schema:
   //   - recurring.plan.*  → data.id IS the plan ID
   //   - recurring.cycle.* → data.id is the CYCLE ID; plan ID is in data.recurring_plan_id
-  // So plan-event handlers fall back to data.id; cycle-event handlers must
-  // read data.recurring_plan_id (NEVER data.id) to look up the subscription.
-  const planId =
-    type.startsWith('recurring.cycle.')
-      ? data.recurring_plan_id
-      : data.recurring_plan_id ?? data.id;
+  const planId = type.startsWith('recurring.cycle.')
+    ? data.recurring_plan_id
+    : data.recurring_plan_id ?? data.id;
 
   if (!planId) {
-    console.warn('[xendit-webhook] No plan ID in event:', type);
+    log.warn('webhook.no_plan_id', { type });
     return;
   }
 
-  // Lookup subscription. Include all fields needed for Shopify sync.
   const { data: sub } = await admin
     .from('subscriptions')
     .select(
-      'id, status, plan_code, amount, currency, shopify_customer_id, shopify_customer_email, xendit_plan_id, metadata'
+      'id, status, plan_code, amount, currency, shopify_customer_id, shopify_customer_email, xendit_plan_id, metadata',
     )
     .eq('xendit_plan_id', planId)
-    .maybeSingle();
+    .maybeSingle<SubscriptionRow>();
 
   if (!sub) {
-    console.warn('[xendit-webhook] Subscription not found for plan:', planId);
+    log.warn('webhook.subscription_not_found', { type, planId });
     return;
   }
+
+  const memberTags = membershipTagsForPlan(sub.plan_code);
 
   switch (type) {
     case 'recurring.plan.activated': {
@@ -126,27 +194,38 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
       // The matching `recurring.cycle.succeeded` event (fires alongside)
       // carries the cycle ID and is the sole entry point for Shopify order
       // creation.
-      let nextExecutionAt = data.schedule?.next_execution_at ?? null;
-
-      if (!nextExecutionAt) {
-        try {
-          const plan = await getRecurringPlan(planId);
-          nextExecutionAt = plan.schedule?.next_execution_at ?? null;
-        } catch (err) {
-          console.warn('[xendit-webhook] Could not refetch plan schedule:', err);
-        }
-      }
+      const nextFromPayload = data.schedule?.next_execution_at ?? null;
 
       await admin
         .from('subscriptions')
         .update({
           status: 'ACTIVE',
           current_period_start: new Date().toISOString(),
-          current_period_end: nextExecutionAt,
+          current_period_end: nextFromPayload,
         })
         .eq('id', sub.id);
 
-      await applyCustomerTag(admin, sub.id, sub.shopify_customer_id, MEMBER_TAG, 'add');
+      // If Xendit didn't include `next_execution_at`, refetch the plan to
+      // backfill it — but do this AFTER returning so the webhook doesn't
+      // block on extra network calls (Xendit's webhook timeout is tight).
+      if (!nextFromPayload) {
+        after(async () => {
+          try {
+            const plan = await getRecurringPlan(planId);
+            const next = plan.schedule?.next_execution_at;
+            if (next) {
+              await admin
+                .from('subscriptions')
+                .update({ current_period_end: next })
+                .eq('id', sub.id);
+            }
+          } catch (err) {
+            log.warn('webhook.refetch_plan_failed', { planId, error: String(err).slice(0, 200) });
+          }
+        });
+      }
+
+      await applyCustomerTags(admin, sub.id, sub.shopify_customer_id, memberTags, 'add');
       break;
     }
 
@@ -155,30 +234,41 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
         .from('subscriptions')
         .update({ status: 'CANCELED', canceled_at: new Date().toISOString() })
         .eq('id', sub.id);
-      await applyCustomerTag(admin, sub.id, sub.shopify_customer_id, MEMBER_TAG, 'remove');
+      await applyCustomerTags(admin, sub.id, sub.shopify_customer_id, memberTags, 'remove');
       break;
     }
 
     case 'recurring.cycle.created': {
       // Cycle exists in Xendit but charge not yet attempted. Pre-create
-      // invoice row as PENDING; later cycle.succeeded will update it.
-      // For cycle events, data.id IS the cycle ID.
+      // invoice row as PENDING — but ONLY if no row exists yet. Without this
+      // guard, an out-of-order `cycle.created` arriving AFTER its matching
+      // `cycle.succeeded` would regress the invoice from SUCCEEDED → PENDING,
+      // corrupting the customer's invoice history.
       const cycleId = data.id;
       if (!cycleId) break;
 
+      const { data: existing } = await admin
+        .from('subscription_invoices')
+        .select('id')
+        .eq('xendit_cycle_id', cycleId)
+        .maybeSingle();
+      if (existing) break;
+
       await admin
         .from('subscription_invoices')
-        .upsert(
-          {
-            subscription_id: sub.id,
-            xendit_cycle_id: cycleId,
-            amount: data.amount ?? sub.amount,
-            currency: data.currency ?? sub.currency,
-            status: 'PENDING',
-            raw_payload: data,
-          },
-          { onConflict: 'xendit_cycle_id', ignoreDuplicates: false }
-        );
+        .insert({
+          subscription_id: sub.id,
+          xendit_cycle_id: cycleId,
+          amount: data.amount ?? sub.amount,
+          currency: data.currency ?? sub.currency,
+          status: 'PENDING',
+          raw_payload: data,
+        })
+        .then((r) => {
+          // Race: another worker may have created the row between our SELECT
+          // and INSERT. Unique constraint catches it; we ignore that case.
+          if (r.error && r.error.code !== '23505') throw r.error;
+        });
       break;
     }
 
@@ -195,7 +285,7 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
         .eq('id', sub.id);
 
       await syncSucceededCycle(admin, sub, data);
-      await applyCustomerTag(admin, sub.id, sub.shopify_customer_id, MEMBER_TAG, 'add');
+      await applyCustomerTags(admin, sub.id, sub.shopify_customer_id, memberTags, 'add');
       break;
     }
 
@@ -213,13 +303,21 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
         .update({ status: 'CANCELED', canceled_at: new Date().toISOString() })
         .eq('id', sub.id);
 
-      // For cycle events, data.id IS the cycle ID (verified above).
       const cycleId = data.id;
       const paymentId = data.payment_id ?? null;
 
       if (cycleId) {
-        await admin.from('subscription_invoices').upsert(
-          {
+        // Same guard as cycle.created: only write a FAILED row if the cycle
+        // hasn't already been recorded as SUCCEEDED (which would mean
+        // out-of-order delivery and the failed event is stale).
+        const { data: existing } = await admin
+          .from('subscription_invoices')
+          .select('id, status')
+          .eq('xendit_cycle_id', cycleId)
+          .maybeSingle();
+
+        if (!existing) {
+          const insertRes = await admin.from('subscription_invoices').insert({
             subscription_id: sub.id,
             xendit_cycle_id: cycleId,
             xendit_payment_id: paymentId,
@@ -227,28 +325,43 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
             currency: data.currency ?? sub.currency,
             status: 'FAILED',
             failure_reason: data.failure_code ?? data.failure_reason ?? null,
-            shopify_sync_status: 'SKIPPED',         // no order for failed cycles
+            shopify_sync_status: 'SKIPPED',
             raw_payload: data,
-          },
-          { onConflict: 'xendit_cycle_id' }
-        );
+          });
+          if (insertRes.error && insertRes.error.code !== '23505') throw insertRes.error;
+        } else if (existing.status !== 'SUCCEEDED') {
+          await admin
+            .from('subscription_invoices')
+            .update({
+              status: 'FAILED',
+              failure_reason: data.failure_code ?? data.failure_reason ?? null,
+              shopify_sync_status: 'SKIPPED',
+              raw_payload: data,
+            })
+            .eq('id', existing.id);
+        } else {
+          log.warn('webhook.cycle_failed_after_succeeded', {
+            cycleId,
+            planId,
+            note: 'ignoring stale failed event',
+          });
+        }
       }
 
-      await applyCustomerTag(admin, sub.id, sub.shopify_customer_id, MEMBER_TAG, 'remove');
+      await applyCustomerTags(admin, sub.id, sub.shopify_customer_id, memberTags, 'remove');
       break;
     }
 
     case 'payment.succeeded':
-    case 'payment.failed': {
+    case 'payment.failed':
       // These events fire alongside recurring.cycle.* for the same charge.
       // We intentionally ignore them: handling here would either duplicate
       // work or use wrong IDs (data.id is payment ID, not cycle ID).
       // Source of truth is the recurring.cycle.* event.
       break;
-    }
 
     default:
-      console.log('[xendit-webhook] Unhandled event:', type);
+      log.info('webhook.unhandled_event', { type });
   }
 }
 
@@ -258,16 +371,17 @@ async function handleEvent(type: string, data: any, admin: Admin): Promise<void>
  * failure, persist the error and leave shopify_sync_status='FAILED'
  * so /api/admin/reconcile can retry later.
  */
-async function syncSucceededCycle(admin: Admin, sub: any, data: any): Promise<void> {
-  // For recurring.cycle.succeeded, data.id IS the cycle ID. Payment ID is
-  // a separate field. We use cycle ID as the idempotency key (matches the
-  // tag we set on the Shopify order).
+async function syncSucceededCycle(
+  admin: Admin,
+  sub: SubscriptionRow,
+  data: EventData,
+): Promise<void> {
   const cycleId = data.id;
   const paymentId = data.payment_id ?? null;
   const amount = data.amount ?? sub.amount;
 
   if (!cycleId) {
-    console.warn('[xendit-webhook] cycle.succeeded without cycle ID', data);
+    log.warn('webhook.cycle_succeeded_no_id', { planId: sub.xendit_plan_id });
     return;
   }
 
@@ -286,22 +400,20 @@ async function syncSucceededCycle(admin: Admin, sub: any, data: any): Promise<vo
         paid_at: new Date().toISOString(),
         raw_payload: data,
       },
-      { onConflict: 'xendit_cycle_id' }
+      { onConflict: 'xendit_cycle_id' },
     )
     .select('id, shopify_sync_status, shopify_order_id, shopify_sync_attempts')
     .single();
 
   if (upsertErr || !invoiceRow) {
-    console.error('[xendit-webhook] Invoice upsert failed:', upsertErr);
+    log.error('webhook.invoice_upsert_failed', { cycleId, error: upsertErr?.message });
     throw upsertErr ?? new Error('Invoice upsert returned no row');
   }
 
-  // If already synced (e.g. webhook re-delivery after first success), skip.
   if (invoiceRow.shopify_sync_status === 'SYNCED' && invoiceRow.shopify_order_id) {
     return;
   }
 
-  // Attempt Shopify order creation. Caught errors do NOT propagate.
   try {
     const order = await createPaidOrder({
       shopifyCustomerId: sub.shopify_customer_id,
@@ -312,7 +424,7 @@ async function syncSucceededCycle(admin: Admin, sub: any, data: any): Promise<vo
       planCode: sub.plan_code,
       xenditCycleId: cycleId,
       xenditPlanId: sub.xendit_plan_id,
-      xenditPaymentId: paymentId,
+      xenditPaymentId: paymentId ?? undefined,
       cycleDate: data.cycle_date,
     });
 
@@ -332,7 +444,7 @@ async function syncSucceededCycle(admin: Admin, sub: any, data: any): Promise<vo
       err instanceof ShopifyError
         ? `${err.status}: ${err.body}`.slice(0, 1000)
         : String(err).slice(0, 1000);
-    console.error('[xendit-webhook] Shopify order sync failed:', message);
+    log.error('webhook.shopify_order_failed', { cycleId, error: message });
     await admin
       .from('subscription_invoices')
       .update({
@@ -341,27 +453,30 @@ async function syncSucceededCycle(admin: Admin, sub: any, data: any): Promise<vo
         shopify_sync_error: message,
       })
       .eq('id', invoiceRow.id);
+    // Fire-and-forget alert so a human notices a money-relevant failure.
+    after(() =>
+      alert('Shopify order sync FAILED — needs reconcile', {
+        invoiceId: invoiceRow.id,
+        cycleId,
+        error: message,
+      }),
+    );
     // Do NOT re-throw — webhook should ack so Xendit stops retrying.
-    // /api/admin/reconcile will handle retry.
   }
 }
 
-/**
- * Apply or remove a customer tag in Shopify. Updates the subscription
- * row's shopify_tag_status so we can audit and reconcile.
- */
-async function applyCustomerTag(
+async function applyCustomerTags(
   admin: Admin,
   subId: string,
   shopifyCustomerId: string,
-  tag: string,
-  action: 'add' | 'remove'
+  tags: string[],
+  action: 'add' | 'remove',
 ): Promise<void> {
   try {
     if (action === 'add') {
-      await addCustomerTag(shopifyCustomerId, tag);
+      await addCustomerTag(shopifyCustomerId, tags);
     } else {
-      await removeCustomerTag(shopifyCustomerId, tag);
+      await removeCustomerTag(shopifyCustomerId, tags);
     }
     await admin
       .from('subscriptions')
@@ -376,7 +491,7 @@ async function applyCustomerTag(
       err instanceof ShopifyError
         ? `${err.status}: ${err.body}`.slice(0, 1000)
         : String(err).slice(0, 1000);
-    console.error('[xendit-webhook] Customer tag failed:', message);
+    log.error('webhook.customer_tag_failed', { subId, action, error: message });
     await admin
       .from('subscriptions')
       .update({

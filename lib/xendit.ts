@@ -1,11 +1,8 @@
-const BASE = process.env.XENDIT_API_URL ?? 'https://api.xendit.co';
-const SECRET = process.env.XENDIT_SECRET_KEY!;
+import { env } from './env';
 
-if (!SECRET) {
-  throw new Error('XENDIT_SECRET_KEY is not set');
+function authHeader(): string {
+  return `Basic ${Buffer.from(`${env.XENDIT_SECRET_KEY}:`).toString('base64')}`;
 }
-
-const authHeader = `Basic ${Buffer.from(`${SECRET}:`).toString('base64')}`;
 
 export class XenditError extends Error {
   constructor(public status: number, public body: string, public code?: string) {
@@ -15,11 +12,11 @@ export class XenditError extends Error {
 }
 
 async function xenditFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${env.XENDIT_API_URL}${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      Authorization: authHeader,
+      Authorization: authHeader(),
       ...init.headers,
     },
   });
@@ -50,11 +47,21 @@ export async function createOrGetCustomer(input: {
   surname?: string;
   mobileNumber?: string;
 }): Promise<XenditCustomer> {
-  // Cek apakah customer sudah ada
-  const existing = await xenditFetch<{ data: XenditCustomer[] }>(
-    `/customers?reference_id=${encodeURIComponent(input.referenceId)}`
-  );
-  if (existing.data?.length > 0) return existing.data[0];
+  // Cek apakah customer sudah ada.
+  // Xendit Customer API quirk: GET /customers?reference_id=X returns HTTP 400
+  // with error_code=CLIENT_NOT_FOUND_ERROR when no match exists (instead of
+  // an empty data array). Treat that as "doesn't exist yet" and fall through
+  // to the create path. Any other error must still propagate.
+  try {
+    const existing = await xenditFetch<{ data: XenditCustomer[] }>(
+      `/customers?reference_id=${encodeURIComponent(input.referenceId)}`
+    );
+    if (existing.data?.length > 0) return existing.data[0];
+  } catch (err) {
+    if (!(err instanceof XenditError && err.code === 'CLIENT_NOT_FOUND_ERROR')) {
+      throw err;
+    }
+  }
 
   return xenditFetch<XenditCustomer>('/customers', {
     method: 'POST',
