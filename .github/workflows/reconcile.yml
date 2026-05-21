@@ -1,0 +1,99 @@
+name: Reconcile (every 15 min)
+
+# Why this exists:
+#   Vercel Hobby plan restricts crons to once per day. For a payment-sync
+#   reconciler that retries failed Shopify orders + cleans stale reservations,
+#   24h latency is unacceptable. GitHub Actions cron is free, supports a
+#   5-minute minimum interval, and just needs HTTPS + a Bearer token.
+#
+#   The Vercel daily cron in vercel.json is kept as a safety net in case
+#   GitHub Actions is degraded.
+#
+# Optimization:
+#   We hit /api/health first (single DB count query, cheap). If backlog is
+#   zero we SKIP the reconcile call — saves Supabase row-budget and avoids
+#   noise in audit_log when there's nothing to do. Health check itself is
+#   public (no auth needed) and only reports counts, not data.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run reconcile even if backlog is zero'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate secrets
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "::error::APP_URL or CRON_SECRET secret is missing."
+            exit 1
+          fi
+
+      - name: Probe /api/health
+        id: probe
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          # Fail-soft: if health probe itself errors, we still run reconcile.
+          health=$(curl -sS --max-time 20 "$APP_URL/api/health" || echo '{}')
+          echo "Health response: $health"
+
+          pending=$(echo "$health" | jq -r '.backlog.pending_invoices // 0')
+          dead=$(echo "$health" | jq -r '.backlog.dead_invoices // 0')
+          failed_tags=$(echo "$health" | jq -r '.backlog.failed_tags // 0')
+          ok=$(echo "$health" | jq -r '.ok // false')
+
+          backlog_total=$((pending + failed_tags))
+          echo "ok=$ok pending=$pending dead=$dead failed_tags=$failed_tags total=$backlog_total"
+          echo "backlog_total=$backlog_total" >> "$GITHUB_OUTPUT"
+          echo "dead=$dead" >> "$GITHUB_OUTPUT"
+
+          # Surface dead-letters loudly — they need human intervention.
+          if [ "$dead" -gt 0 ]; then
+            echo "::warning::$dead invoice(s) are DEAD-LETTERED — manual fix required"
+          fi
+
+      - name: Skip if backlog empty
+        id: maybe_skip
+        if: ${{ inputs.force != true && steps.probe.outputs.backlog_total == '0' }}
+        run: |
+          echo "Backlog is zero. Skipping reconcile run to conserve resources."
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger reconcile
+        if: ${{ steps.maybe_skip.outputs.skipped != 'true' }}
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          response=$(curl -fsS \
+            --max-time 90 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$APP_URL/api/admin/reconcile/cron")
+          echo "Reconcile response: $response"
+
+          invoice_failed=$(echo "$response" | jq -r '.invoice_sync.failed // 0')
+          invoice_dead=$(echo "$response" | jq -r '.invoice_sync.dead_lettered // 0')
+          tag_failed=$(echo "$response" | jq -r '.tag_fix.failed // 0')
+          if [ "$invoice_failed" != "0" ] || [ "$tag_failed" != "0" ] || [ "$invoice_dead" != "0" ]; then
+            echo "::warning::Reconcile unresolved — invoice_failed=$invoice_failed dead=$invoice_dead tag_failed=$tag_failed"
+          fi

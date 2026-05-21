@@ -11,6 +11,8 @@ import {
 import { membershipTagsForPlan } from '@/lib/plans';
 import { env } from '@/lib/env';
 import { log, alert } from '@/lib/logger';
+import { nextRetry } from '@/lib/backoff';
+import { consumeRateLimit, clientIp } from '@/lib/rate-limit';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -77,6 +79,25 @@ type Admin = ReturnType<typeof createAdminClient>;
  *   5. Mark webhook event as processed.
  */
 export async function POST(req: Request) {
+  const ip = clientIp(req);
+
+  // 0a. Optional IP allowlist — if configured, reject anything not from Xendit.
+  //     Layered on top of x-callback-token so a leaked token isn't sufficient.
+  const allowed = env.XENDIT_WEBHOOK_IPS;
+  if (allowed.length > 0 && !allowed.includes(ip)) {
+    log.warn('webhook.ip_not_allowed', { ip });
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+
+  // 0b. Rate-limit per source IP. Generous bucket so legitimate Xendit retries
+  //     flow freely (default 60 burst, 2/sec sustained). DB-backed so it
+  //     persists across cold starts. Fail-open if DB blip.
+  const rl = await consumeRateLimit(`webhook:${ip}`, { capacity: 60, refillPerSec: 2 });
+  if (!rl.allowed) {
+    log.warn('webhook.rate_limited', { ip });
+    return NextResponse.json({ error: 'Rate limited' }, { status: 429 });
+  }
+
   // 1. Constant-time token verification — prevents timing-based brute force.
   const provided = req.headers.get('x-callback-token') ?? '';
   const expected = env.XENDIT_WEBHOOK_TOKEN;
@@ -84,7 +105,7 @@ export async function POST(req: Request) {
     provided.length === expected.length &&
     crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
   if (!tokenOk) {
-    log.warn('webhook.invalid_token');
+    log.warn('webhook.invalid_token', { ip });
     return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
   }
 
@@ -445,20 +466,40 @@ async function syncSucceededCycle(
         ? `${err.status}: ${err.body}`.slice(0, 1000)
         : String(err).slice(0, 1000);
     log.error('webhook.shopify_order_failed', { cycleId, error: message });
+
+    // Schedule next retry using exponential backoff. We pass attemptsSoFar=1
+    // (this was the first attempt and it just failed). Reconcile will pick it
+    // up at next_retry_at.
+    const decision = nextRetry(1);
+    const update =
+      decision.kind === 'dead'
+        ? {
+            shopify_sync_status: 'DEAD',
+            shopify_sync_dead_letter: true,
+            shopify_sync_attempts: 1,
+            shopify_sync_error: message,
+            last_retry_at: new Date().toISOString(),
+            next_retry_at: null,
+          }
+        : {
+            shopify_sync_status: 'FAILED',
+            shopify_sync_attempts: 1,
+            shopify_sync_error: message,
+            last_retry_at: new Date().toISOString(),
+            next_retry_at: decision.nextRetryAt.toISOString(),
+          };
     await admin
       .from('subscription_invoices')
-      .update({
-        shopify_sync_status: 'FAILED',
-        shopify_sync_attempts: (invoiceRow.shopify_sync_attempts ?? 0) + 1,
-        shopify_sync_error: message,
-      })
+      .update(update)
       .eq('id', invoiceRow.id);
+
     // Fire-and-forget alert so a human notices a money-relevant failure.
     after(() =>
-      alert('Shopify order sync FAILED — needs reconcile', {
+      alert('Shopify order sync FAILED — auto-retrying via reconcile', {
         invoiceId: invoiceRow.id,
         cycleId,
         error: message,
+        nextRetryAt: decision.kind === 'retry' ? decision.nextRetryAt.toISOString() : 'DEAD',
       }),
     );
     // Do NOT re-throw — webhook should ack so Xendit stops retrying.

@@ -85,4 +85,15 @@ export const env = {
   get CRON_SECRET() {
     return readOptional('CRON_SECRET');
   },
+
+  // Optional comma-separated IP allowlist for the Xendit webhook endpoint.
+  // When set, requests from any other IP are rejected with 403. Layered on
+  // top of `x-callback-token` so a leaked token alone isn't enough.
+  //
+  // Get the current Xendit webhook IPs from their dashboard / support and
+  // set XENDIT_WEBHOOK_IPS="ip1,ip2,...". When unset, all IPs are accepted.
+  get XENDIT_WEBHOOK_IPS(): string[] {
+    const raw = readOptional('XENDIT_WEBHOOK_IPS');
+    return raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  },
 };

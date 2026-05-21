@@ -25,6 +25,14 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Unit tests
+        run: npm test
+
+      - name: Security audit (high+ severity)
+        # Fails CI on any high/critical vulnerability in production deps.
+        # Non-prod deps are reported but don't fail the build.
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Build
         # Dummy env so module-level reads don't fail. Real secrets are only
         # needed at runtime, not at build. We supply syntactically valid
@@ -39,4 +47,5 @@ jobs:
           SHOPIFY_APP_PROXY_SECRET: dummy_build_only
           NEXT_PUBLIC_APP_URL: https://example.com
           ADMIN_RECONCILE_TOKEN: dummy_build_only_token_long_enough_for_compare
+          # VERCEL_ENV is unset so the localhost guard in lib/env.ts doesn't fire.
         run: npm run build

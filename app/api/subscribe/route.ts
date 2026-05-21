@@ -11,6 +11,7 @@ import { verifyAppProxy } from '@/lib/shopify-proxy';
 import { getCustomer, ShopifyError } from '@/lib/shopify';
 import { env } from '@/lib/env';
 import { log } from '@/lib/logger';
+import { consumeRateLimit } from '@/lib/rate-limit';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -56,6 +57,19 @@ export async function GET(req: Request) {
     return NextResponse.redirect(
       `https://${ctx.shopDomain}/account/login?return_url=/products`,
     );
+  }
+
+  // 3a. Per-customer rate-limit: prevents a logged-in user from accidentally
+  //     (or maliciously) hammering the Xendit + Shopify APIs by holding the
+  //     subscribe button. 5-burst, refill ~1 per 20s — generous for humans,
+  //     tight for bots.
+  const rl = await consumeRateLimit(`subscribe:${ctx.shopifyCustomerId}`, {
+    capacity: 5,
+    refillPerSec: 0.05,
+  });
+  if (!rl.allowed) {
+    log.warn('subscribe.rate_limited', { shopifyCustomerId: ctx.shopifyCustomerId });
+    return new NextResponse('Too many requests, please wait a moment', { status: 429 });
   }
 
   // 4. Validate plan

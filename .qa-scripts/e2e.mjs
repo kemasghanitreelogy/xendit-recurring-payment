@@ -266,6 +266,74 @@ async function xenditApi(path, init) {
   record('subscribe.shop-mismatch.403', res.status === 403, `got ${res.status}`);
 }
 
+// 1.19 /api/health → 200 with backlog counts
+{
+  const res = await fetch(`${APP_URL}/api/health`);
+  const body = await res.json();
+  const ok =
+    res.status === 200 &&
+    body.ok === true &&
+    body.checks?.db === 'ok' &&
+    typeof body.backlog?.pending_invoices === 'number';
+  record('health.200', ok, `status=${res.status} body=${JSON.stringify(body).slice(0, 150)}`);
+}
+
+// 1.20 Middleware adds X-Request-Id to every response
+{
+  const res = await fetch(`${APP_URL}/api/health`);
+  const id = res.headers.get('x-request-id');
+  record('middleware.request-id', !!id && id.length > 0, `id=${id}`);
+}
+
+// 1.21 Middleware honors inbound X-Request-Id (when format is valid)
+{
+  const sentId = 'qa-trace-12345';
+  const res = await fetch(`${APP_URL}/api/health`, {
+    headers: { 'x-request-id': sentId },
+  });
+  record(
+    'middleware.request-id-propagation',
+    res.headers.get('x-request-id') === sentId,
+    `sent=${sentId} got=${res.headers.get('x-request-id')}`,
+  );
+}
+
+// 1.22 Middleware sets baseline security headers
+{
+  const res = await fetch(`${APP_URL}/api/health`);
+  const hsts = res.headers.get('strict-transport-security');
+  const xfo = res.headers.get('x-frame-options');
+  const xcto = res.headers.get('x-content-type-options');
+  record(
+    'middleware.security-headers',
+    hsts?.includes('max-age') && xfo === 'DENY' && xcto === 'nosniff',
+    `hsts=${hsts?.slice(0, 30)} xfo=${xfo} xcto=${xcto}`,
+  );
+}
+
+// 1.23 Webhook replay: unauth → 401
+{
+  const res = await fetch(`${APP_URL}/api/admin/webhook-replay`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ eventId: 'whatever' }),
+  });
+  record('webhook-replay.no-auth.401', res.status === 401, `got ${res.status}`);
+}
+
+// 1.24 Webhook replay: nonexistent event → 404
+{
+  const res = await fetch(`${APP_URL}/api/admin/webhook-replay`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${RECONCILE_TOKEN}`,
+    },
+    body: JSON.stringify({ eventId: 'evt_does_not_exist_anywhere' }),
+  });
+  record('webhook-replay.nonexistent.404', res.status === 404, `got ${res.status}`);
+}
+
 // =================================================================
 // SECTION 2: FULL SUBSCRIBE FLOW (creates real Xendit plan, then cleans up)
 // =================================================================
@@ -729,6 +797,80 @@ if (testCustomerId) {
 }
 
 // =================================================================
+// SECTION 6: Audit log captures cron reconcile run
+// =================================================================
+{
+  // Trigger one cron run, then verify an audit row was created.
+  const before = Date.now();
+  await fetch(`${APP_URL}/api/admin/reconcile/cron`, {
+    headers: { Authorization: `Bearer ${CRON_SECRET}` },
+  });
+  // Allow a moment for the audit row to flush.
+  await new Promise((r) => setTimeout(r, 500));
+  const { data: rows } = await supabase
+    .from('audit_log')
+    .select('action, actor, occurred_at')
+    .eq('action', 'reconcile.run')
+    .eq('actor', 'cron')
+    .gte('occurred_at', new Date(before - 1000).toISOString())
+    .order('occurred_at', { ascending: false })
+    .limit(1);
+  record(
+    'audit.reconcile-run-logged',
+    rows?.length === 1,
+    `rows=${rows?.length ?? 0}`,
+  );
+}
+
+// =================================================================
+// SECTION 7: Webhook replay round-trip
+// =================================================================
+{
+  // Insert a fake processed event, then replay it.
+  const fakeEventId = `evt_qa_replay_${Date.now()}`;
+  await supabase.from('xendit_webhook_events').insert({
+    id: fakeEventId,
+    event_type: 'recurring.plan.activated',
+    payload: {
+      id: fakeEventId,
+      event: 'recurring.plan.activated',
+      data: { id: 'repl_does_not_exist_for_replay_test' },
+    },
+    processed_at: new Date().toISOString(),
+  });
+  const res = await fetch(`${APP_URL}/api/admin/webhook-replay`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${RECONCILE_TOKEN}`,
+    },
+    body: JSON.stringify({ eventId: fakeEventId }),
+  });
+  const body = await res.json();
+  // Handler will return ok because the plan ID doesn't exist — that's a warn,
+  // not an error. The replay round-trip itself should succeed (200 dispatch).
+  record(
+    'webhook-replay.dispatch.ok',
+    res.status === 200 && body.dispatch?.status === 200,
+    `status=${res.status} dispatch=${JSON.stringify(body.dispatch).slice(0, 120)}`,
+  );
+
+  // Verify audit entry exists
+  await new Promise((r) => setTimeout(r, 300));
+  const { data: auditRows } = await supabase
+    .from('audit_log')
+    .select('id')
+    .eq('action', 'webhook.replay')
+    .eq('target_id', fakeEventId)
+    .limit(1);
+  record('webhook-replay.audit-row', auditRows?.length === 1, `rows=${auditRows?.length}`);
+
+  // Cleanup replay artifacts (the replay re-creates the row through dispatch)
+  await supabase.from('xendit_webhook_events').delete().eq('id', fakeEventId);
+  await supabase.from('audit_log').delete().eq('target_id', fakeEventId);
+}
+
+// =================================================================
 // CLEANUP
 // =================================================================
 if (xenditPlanIdForCleanup) {
@@ -752,6 +894,9 @@ if (testCustomerId) {
   await supabase.from('subscriptions').delete().eq('shopify_customer_id', testCustomerId);
   // Wipe QA webhook events (any id starting with evt_qa_)
   await supabase.from('xendit_webhook_events').delete().like('id', 'evt_qa_%');
+  // Wipe rate-limit + audit rows from QA noise so subsequent runs start clean.
+  await supabase.from('rate_limit_counters').delete().like('bucket_key', 'webhook:%');
+  await supabase.from('rate_limit_counters').delete().like('bucket_key', 'subscribe:%');
 
   // 2. Delete Shopify orders for this customer (required before customer delete)
   const ordersRes = await shopifyAdmin(

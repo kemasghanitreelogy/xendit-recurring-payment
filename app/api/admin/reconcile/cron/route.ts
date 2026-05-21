@@ -37,6 +37,6 @@ export async function GET(req: Request) {
   }
 
   const admin = createAdminClient();
-  const result = await runReconcile(admin, { dryRun: false });
+  const result = await runReconcile(admin, { dryRun: false, actor: 'cron' });
   return NextResponse.json({ source: 'cron', ...result });
 }

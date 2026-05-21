@@ -189,7 +189,21 @@ git push -u origin main
    - `ALERT_WEBHOOK_URL` = Slack/Discord incoming webhook URL untuk alert webhook failures
 4. Deploy
 
-> 💡 **Vercel Cron** sudah dikonfigurasi di `vercel.json` — auto-trigger `/api/admin/reconcile/cron` setiap 15 menit untuk retry Shopify sync failures + cleanup reservation row yang stale > 24 jam. Tanpa `CRON_SECRET`, endpoint return 503.
+> 💡 **Reconciliation scheduling** (penting untuk Hobby plan)
+>
+> Vercel Hobby cron dibatasi **1×/hari** dengan timing precision ±59 menit ([source](https://vercel.com/docs/cron-jobs/usage-and-pricing)). 24 jam terlalu lambat untuk retry Shopify sync failures.
+>
+> **Solusi (sudah ter-set-up di repo ini):**
+> - `vercel.json` jadwal: **harian jam 03:00 WIB** — safety net, deploy-safe di Hobby
+> - `.github/workflows/reconcile.yml` jadwal: **setiap 15 menit** via GitHub Actions cron (free, hit endpoint `/api/admin/reconcile/cron` pakai `CRON_SECRET`)
+>
+> Setup GitHub Actions cron:
+> 1. Repo → Settings → Secrets and variables → Actions → New repository secret
+> 2. Tambah `APP_URL` = `https://your-project.vercel.app`
+> 3. Tambah `CRON_SECRET` = **nilai yang sama persis** dengan env var `CRON_SECRET` di Vercel project
+> 4. (Optional) Manual trigger: Actions tab → "Reconcile (every 15 min)" → Run workflow
+>
+> Kalau upgrade ke Vercel Pro nanti, edit `vercel.json` schedule jadi `*/15 * * * *` dan hapus GHA workflow.
 
 ### 5.3 Update Webhook URL + App Proxy URL
 Setelah deploy berhasil, balik ke:
