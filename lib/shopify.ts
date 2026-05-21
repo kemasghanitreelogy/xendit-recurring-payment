@@ -3,8 +3,10 @@
 //
 // Design notes:
 // - Idempotency for order creation is enforced by tagging orders
-//   with `xendit_cycle_id=<id>`. Before creating, we GET orders
-//   with that tag; if found, we return the existing order.
+//   with a hashed cycle-ID tag (see cycleIdTag). Before creating,
+//   we GET orders with that tag; if found, we return the existing
+//   order. The raw cycle ID is also kept in note_attributes for
+//   manual debugging.
 // - Customer tag mutations use the GraphQL `tagsAdd`/`tagsRemove`
 //   mutations because REST `customer.tags` requires fetching all
 //   tags first (race-prone under concurrent webhooks).
@@ -12,7 +14,18 @@
 //   distinguish payment-provider errors from internal errors.
 // ============================================================
 
+import crypto from 'node:crypto';
 import { env } from './env';
+
+// Shopify caps tag length at 40 chars. Real Xendit cycle IDs (UUID-shaped,
+// often 30-40 chars themselves) overflow once we prefix them, causing
+// `422 Order tags is invalid`. We tag with a stable SHA-1-derived short
+// hash instead; the full ID still lives in `note_attributes.xendit_cycle_id`
+// for human/manual lookup. Tag length is constant 23 chars.
+function cycleIdTag(cycleId: string): string {
+  const h = crypto.createHash('sha1').update(cycleId).digest('hex').slice(0, 16);
+  return `xcycle_${h}`;
+}
 
 function restBase(): string {
   return `https://${env.SHOPIFY_STORE_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}`;
@@ -197,8 +210,8 @@ async function findOrderByXenditCycle(xenditCycleId: string): Promise<ShopifyOrd
         }
       }
     }`,
-    // Shopify order tags can't contain '='; we tag as `xendit_cycle_${id}`.
-    { q: `tag:"xendit_cycle_${xenditCycleId}"` }
+    // Search by the hashed cycle-ID tag (see cycleIdTag() at top of file).
+    { q: `tag:"${cycleIdTag(xenditCycleId)}"` }
   );
 
   const node = data.orders.edges[0]?.node;
@@ -231,14 +244,13 @@ export async function createPaidOrder(input: CreateOrderInput): Promise<ShopifyO
 
   // 2. Build order payload
   const amountStr = input.amount.toString();          // IDR is integer; no decimals
-  // Shopify rejects tags containing '=' (HTTP 422 "Order tags is invalid"),
-  // so we use an underscore-prefixed format. The plan ID is also UUID-shaped
-  // which often pushes the combined tag over Shopify's 40-char limit, so we
-  // keep it in note_attributes only (where IDs of any length are allowed).
+  // Shopify caps tag length at 40 chars. Both plan ID and cycle ID are
+  // UUID-shaped (~37 chars), so we keep their FULL values in note_attributes
+  // and use a short, hash-derived idempotency tag (see cycleIdTag()).
   const tags = [
     'xendit-recurring',
     `subscription-${input.planCode}`,
-    `xendit_cycle_${input.xenditCycleId}`,
+    cycleIdTag(input.xenditCycleId),
   ].join(', ');
 
   const noteAttributes = [

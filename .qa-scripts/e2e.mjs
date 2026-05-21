@@ -871,6 +871,611 @@ if (testCustomerId) {
 }
 
 // =================================================================
+// SECTION 8: Webhook negative paths
+// =================================================================
+
+// 8.1 valid token + invalid JSON body → 400
+{
+  const res = await fetch(`${APP_URL}/api/webhook/xendit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+    body: 'not-valid-json{',
+  });
+  record('webhook.invalid-json.400', res.status === 400, `got ${res.status}`);
+}
+
+// 8.2 valid token + JSON that isn't an object → 400 invalid payload shape
+{
+  const res = await fetch(`${APP_URL}/api/webhook/xendit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+    body: JSON.stringify('plain-string-not-object'),
+  });
+  record('webhook.bad-payload-shape.400', res.status === 400, `got ${res.status}`);
+}
+
+// 8.3 unknown event type → still 200 (ack-and-log behavior so Xendit stops retrying)
+{
+  const evt = {
+    id: `evt_qa_unknown_${Date.now()}`,
+    event: 'recurring.totally.unknown',
+    created: new Date().toISOString(),
+    business_id: 'qa',
+    data: { id: 'noop' },
+  };
+  const res = await fetch(`${APP_URL}/api/webhook/xendit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+    body: JSON.stringify(evt),
+  });
+  const body = await res.json();
+  record(
+    'webhook.unknown-event.200',
+    res.status === 200 && body.ok === true,
+    `status=${res.status} body=${JSON.stringify(body)}`,
+  );
+}
+
+// =================================================================
+// SECTION 9: recurring.cycle.failed → sub CANCELED + FAILED invoice + tags removed
+// =================================================================
+{
+  let cfId = null;
+  let cfSub = null;
+  try {
+    const { status: cs, body: cb } = await shopifyAdmin('/customers.json', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: {
+          first_name: 'QA',
+          last_name: 'CycleFailed',
+          email: `qa+cycle-failed-${Date.now()}@treelogy.com`,
+          verified_email: true,
+          tags: 'qa-test',
+        },
+      }),
+    });
+    if (cs !== 201 || !cb?.customer?.id) {
+      record('webhook.cycle.failed.setup', false, `customer create failed: ${cs}`);
+    } else {
+      cfId = String(cb.customer.id);
+      const subRes = await fetch(
+        buildSignedUrl('/api/subscribe', { plan_code: 'pro_monthly' }, cfId),
+        { redirect: 'manual' },
+      );
+      const subLoc = subRes.headers.get('location') ?? '';
+      if (!/xendit/i.test(subLoc)) {
+        record('webhook.cycle.failed.setup', false, `subscribe failed: ${subRes.status} ${subLoc.slice(0, 80)}`);
+      } else {
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select('id, xendit_plan_id')
+          .eq('shopify_customer_id', cfId)
+          .single();
+        cfSub = sub;
+        record('webhook.cycle.failed.setup', true, `sub=${sub?.id}`);
+
+        // Activate (tags applied)
+        await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_cf_act_${Date.now()}`,
+            event: 'recurring.plan.activated',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: { id: sub.xendit_plan_id, schedule: { next_execution_at: '2026-06-21T00:00:00Z' } },
+          }),
+        });
+
+        // Now send cycle.failed
+        const cycleId = `qa_cycle_failed_${Date.now()}`;
+        const res = await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_cf_${Date.now()}`,
+            event: 'recurring.cycle.failed',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: {
+              id: cycleId,
+              recurring_plan_id: sub.xendit_plan_id,
+              amount: 99000,
+              currency: 'IDR',
+              failure_code: 'CARD_DECLINED',
+              payment_id: 'pay_qa_failed',
+            },
+          }),
+        });
+        const body = await res.json();
+        record('webhook.cycle.failed.200', res.status === 200 && body.ok === true, `body=${JSON.stringify(body)}`);
+
+        const { data: subAfter } = await supabase
+          .from('subscriptions')
+          .select('status, canceled_at')
+          .eq('id', sub.id)
+          .single();
+        record(
+          'webhook.cycle.failed.sub-canceled',
+          subAfter?.status === 'CANCELED' && subAfter?.canceled_at != null,
+          `status=${subAfter?.status} canceled_at=${subAfter?.canceled_at}`,
+        );
+
+        const { data: inv } = await supabase
+          .from('subscription_invoices')
+          .select('status, shopify_sync_status, failure_reason')
+          .eq('xendit_cycle_id', cycleId)
+          .single();
+        record(
+          'webhook.cycle.failed.invoice-FAILED',
+          inv?.status === 'FAILED' &&
+            inv?.shopify_sync_status === 'SKIPPED' &&
+            inv?.failure_reason === 'CARD_DECLINED',
+          `status=${inv?.status} sync=${inv?.shopify_sync_status} reason=${inv?.failure_reason}`,
+        );
+
+        const { body: shopBody } = await shopifyAdmin(`/customers/${cfId}.json?fields=id,tags`, {});
+        const remaining = shopBody?.customer?.tags ?? '';
+        const noMembership = !/(\bsubscriber\b|\bpro-member\b|\bplan-pro_monthly\b)/.test(remaining);
+        record('webhook.cycle.failed.tags-removed', noMembership, `tags="${remaining}"`);
+      }
+    }
+  } finally {
+    if (cfSub?.xendit_plan_id && !cfSub.xendit_plan_id.startsWith('pending-')) {
+      try {
+        await xenditApi(`/recurring/plans/${cfSub.xendit_plan_id}/deactivate`, { method: 'POST' });
+      } catch {}
+    }
+    if (cfSub?.id) {
+      await supabase.from('subscription_invoices').delete().eq('subscription_id', cfSub.id);
+      await supabase.from('subscriptions').delete().eq('id', cfSub.id);
+    }
+    if (cfId) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const d = await shopifyAdmin(`/customers/${cfId}.json`, { method: 'DELETE' });
+        if (d.status === 200) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+}
+
+// =================================================================
+// SECTION 10: Cancel ACTIVE subscription → real Xendit deactivate
+// =================================================================
+{
+  let acId = null;
+  let acSub = null;
+  try {
+    const { status: cs, body: cb } = await shopifyAdmin('/customers.json', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: {
+          first_name: 'QA',
+          last_name: 'ActiveCancel',
+          email: `qa+active-cancel-${Date.now()}@treelogy.com`,
+          verified_email: true,
+          tags: 'qa-test',
+        },
+      }),
+    });
+    if (cs !== 201 || !cb?.customer?.id) {
+      record('cancel.active.setup', false, `customer create failed: ${cs}`);
+    } else {
+      acId = String(cb.customer.id);
+      const subRes = await fetch(
+        buildSignedUrl('/api/subscribe', { plan_code: 'pro_monthly' }, acId),
+        { redirect: 'manual' },
+      );
+      const subLoc = subRes.headers.get('location') ?? '';
+      if (!/xendit/i.test(subLoc)) {
+        record('cancel.active.setup', false, `subscribe failed: ${subRes.status} ${subLoc.slice(0, 80)}`);
+      } else {
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select('id, xendit_plan_id')
+          .eq('shopify_customer_id', acId)
+          .single();
+        acSub = sub;
+        record('cancel.active.setup', true, `sub=${sub?.id}`);
+
+        // Activate to ACTIVE state
+        await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_ac_act_${Date.now()}`,
+            event: 'recurring.plan.activated',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: { id: sub.xendit_plan_id, schedule: { next_execution_at: '2026-06-21T00:00:00Z' } },
+          }),
+        });
+
+        // Cancel via signed proxy URL
+        const cres = await fetch(buildSignedUrl('/api/subscription/cancel', {}, acId), { method: 'POST' });
+        const cbody = await cres.json();
+        record(
+          'cancel.active.200',
+          cres.status === 200 && cbody.ok === true && cbody.was !== 'reservation',
+          `status=${cres.status} body=${JSON.stringify(cbody)}`,
+        );
+
+        // Verify the Xendit plan is now INACTIVE
+        const xRes = await xenditApi(`/recurring/plans/${sub.xendit_plan_id}`, {});
+        record(
+          'cancel.active.xendit-inactive',
+          xRes.status === 200 && xRes.body?.status === 'INACTIVE',
+          `xendit_status=${xRes.body?.status}`,
+        );
+      }
+    }
+  } finally {
+    if (acSub?.id) {
+      await supabase.from('subscription_invoices').delete().eq('subscription_id', acSub.id);
+      await supabase.from('subscriptions').delete().eq('id', acSub.id);
+    }
+    if (acId) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const d = await shopifyAdmin(`/customers/${acId}.json`, { method: 'DELETE' });
+        if (d.status === 200) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+}
+
+// =================================================================
+// SECTION 11: Reconcile retry — Shopify-down recovery (money-correctness)
+// Simulates: charge succeeded at Xendit, but Shopify createOrder failed
+// when the webhook fired. The invoice sits as SUCCEEDED+sync=FAILED with
+// next_retry_at in the past → reconcile POST must pick it up and SYNC.
+// =================================================================
+{
+  let rcId = null;
+  let rcSub = null;
+  let rcCycleId = null;
+  try {
+    const { status: cs, body: cb } = await shopifyAdmin('/customers.json', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: {
+          first_name: 'QA',
+          last_name: 'Reconcile',
+          email: `qa+reconcile-${Date.now()}@treelogy.com`,
+          verified_email: true,
+          tags: 'qa-test',
+        },
+      }),
+    });
+    if (cs !== 201 || !cb?.customer?.id) {
+      record('reconcile.retry.setup', false, `customer create failed: ${cs}`);
+    } else {
+      rcId = String(cb.customer.id);
+      const subRes = await fetch(
+        buildSignedUrl('/api/subscribe', { plan_code: 'pro_monthly' }, rcId),
+        { redirect: 'manual' },
+      );
+      const subLoc = subRes.headers.get('location') ?? '';
+      if (!/xendit/i.test(subLoc)) {
+        record('reconcile.retry.setup', false, `subscribe failed: ${subRes.status} ${subLoc.slice(0, 80)}`);
+      } else {
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select('id, xendit_plan_id')
+          .eq('shopify_customer_id', rcId)
+          .single();
+        rcSub = sub;
+
+        // Activate (no Shopify order created — plan.activated only tags)
+        await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_rc_act_${Date.now()}`,
+            event: 'recurring.plan.activated',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: { id: sub.xendit_plan_id, schedule: { next_execution_at: '2026-06-21T00:00:00Z' } },
+          }),
+        });
+
+        // Inject the failed-sync invoice manually.
+        // Cycle ID stays short: Shopify tags must be ≤40 chars and we prepend
+        // `xendit_cycle_` (13 chars) when tagging the order for idempotency.
+        rcCycleId = `qa_rc_${Date.now()}`;
+        const { error: insErr } = await supabase
+          .from('subscription_invoices')
+          .insert({
+            subscription_id: sub.id,
+            xendit_cycle_id: rcCycleId,
+            xendit_payment_id: 'pay_qa_reconcile',
+            amount: 99000,
+            currency: 'IDR',
+            status: 'SUCCEEDED',
+            payment_method: 'CARD',
+            paid_at: new Date().toISOString(),
+            shopify_sync_status: 'FAILED',
+            shopify_sync_attempts: 1,
+            shopify_sync_error: 'simulated Shopify outage',
+            last_retry_at: new Date(Date.now() - 60000).toISOString(),
+            next_retry_at: new Date(Date.now() - 1000).toISOString(),
+            raw_payload: { simulated: true },
+          });
+        if (insErr) {
+          record('reconcile.retry.setup', false, `invoice insert: ${insErr.message}`);
+        } else {
+          record('reconcile.retry.setup', true, `failed invoice cycle=${rcCycleId}`);
+
+          // GET audit shows backlog
+          const getRes = await fetch(`${APP_URL}/api/admin/reconcile`, {
+            headers: { Authorization: `Bearer ${RECONCILE_TOKEN}` },
+          });
+          const getBody = await getRes.json();
+          record(
+            'reconcile.audit.shows-backlog',
+            getRes.status === 200 && getBody.invoices_needing_sync >= 1,
+            `body=${JSON.stringify(getBody)}`,
+          );
+
+          // Dry-run must not mutate
+          const dryRes = await fetch(`${APP_URL}/api/admin/reconcile?dry=1`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${RECONCILE_TOKEN}` },
+          });
+          const dryBody = await dryRes.json();
+          record(
+            'reconcile.dry-run.200',
+            dryRes.status === 200 &&
+              dryBody.dry_run === true &&
+              (dryBody.invoice_sync?.attempted ?? 0) >= 1,
+            `status=${dryRes.status} invoice_sync=${JSON.stringify(dryBody.invoice_sync)}`,
+          );
+          const { data: dryInv } = await supabase
+            .from('subscription_invoices')
+            .select('shopify_sync_status, shopify_order_id, shopify_sync_attempts')
+            .eq('xendit_cycle_id', rcCycleId)
+            .single();
+          record(
+            'reconcile.dry-run.no-mutation',
+            dryInv?.shopify_sync_status === 'FAILED' &&
+              dryInv?.shopify_order_id == null &&
+              dryInv?.shopify_sync_attempts === 1,
+            `sync=${dryInv?.shopify_sync_status} order=${dryInv?.shopify_order_id} attempts=${dryInv?.shopify_sync_attempts}`,
+          );
+
+          // Real retry — should create Shopify order
+          const retryRes = await fetch(`${APP_URL}/api/admin/reconcile`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${RECONCILE_TOKEN}` },
+          });
+          const retryBody = await retryRes.json();
+          record(
+            'reconcile.retry.200',
+            retryRes.status === 200 && (retryBody.invoice_sync?.succeeded ?? 0) >= 1,
+            `status=${retryRes.status} invoice_sync=${JSON.stringify(retryBody.invoice_sync).slice(0, 200)}`,
+          );
+
+          const { data: afterInv } = await supabase
+            .from('subscription_invoices')
+            .select('shopify_sync_status, shopify_order_id, shopify_sync_error, shopify_sync_attempts')
+            .eq('xendit_cycle_id', rcCycleId)
+            .single();
+          record(
+            'reconcile.retry.invoice-SYNCED',
+            afterInv?.shopify_sync_status === 'SYNCED' &&
+              afterInv?.shopify_order_id != null &&
+              afterInv?.shopify_sync_error == null,
+            `sync=${afterInv?.shopify_sync_status} order=${afterInv?.shopify_order_id} err=${(afterInv?.shopify_sync_error ?? '').slice(0, 100)}`,
+          );
+        }
+      }
+    }
+  } finally {
+    if (rcSub?.xendit_plan_id && !rcSub.xendit_plan_id.startsWith('pending-')) {
+      try {
+        await xenditApi(`/recurring/plans/${rcSub.xendit_plan_id}/deactivate`, { method: 'POST' });
+      } catch {}
+    }
+    if (rcId) {
+      // Delete any Shopify order created by the reconcile retry
+      const ordersRes = await shopifyAdmin(`/customers/${rcId}/orders.json?status=any&limit=50`, {});
+      for (const o of ordersRes.body?.orders ?? []) {
+        await shopifyAdmin(`/orders/${o.id}.json`, { method: 'DELETE' });
+      }
+    }
+    if (rcSub?.id) {
+      await supabase.from('subscription_invoices').delete().eq('subscription_id', rcSub.id);
+      await supabase.from('subscriptions').delete().eq('id', rcSub.id);
+    }
+    if (rcId) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const d = await shopifyAdmin(`/customers/${rcId}.json`, { method: 'DELETE' });
+        if (d.status === 200) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+}
+
+// =================================================================
+// SECTION 11b: Long-cycle-ID regression — real Xendit cycle IDs are
+// UUID-shaped (~37 chars). Before the cycleIdTag() fix in lib/shopify.ts,
+// `xendit_cycle_<uuid>` overflowed Shopify's 40-char tag limit and threw
+// 422 "Order tags is invalid". This locks in the fix.
+// =================================================================
+{
+  let lcId = null;
+  let lcSub = null;
+  let lcCycleId = null;
+  try {
+    const { status: cs, body: cb } = await shopifyAdmin('/customers.json', {
+      method: 'POST',
+      body: JSON.stringify({
+        customer: {
+          first_name: 'QA',
+          last_name: 'LongCycle',
+          email: `qa+long-cycle-${Date.now()}@treelogy.com`,
+          verified_email: true,
+          tags: 'qa-test',
+        },
+      }),
+    });
+    if (cs !== 201 || !cb?.customer?.id) {
+      record('long-cycle.setup', false, `customer create failed: ${cs}`);
+    } else {
+      lcId = String(cb.customer.id);
+      const subRes = await fetch(
+        buildSignedUrl('/api/subscribe', { plan_code: 'pro_monthly' }, lcId),
+        { redirect: 'manual' },
+      );
+      const subLoc = subRes.headers.get('location') ?? '';
+      if (!/xendit/i.test(subLoc)) {
+        record('long-cycle.setup', false, `subscribe failed: ${subRes.status} ${subLoc.slice(0, 80)}`);
+      } else {
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select('id, xendit_plan_id')
+          .eq('shopify_customer_id', lcId)
+          .single();
+        lcSub = sub;
+
+        // Activate
+        await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_lc_act_${Date.now()}`,
+            event: 'recurring.plan.activated',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: { id: sub.xendit_plan_id, schedule: { next_execution_at: '2026-06-21T00:00:00Z' } },
+          }),
+        });
+
+        // Realistic UUID-shaped Xendit cycle ID (37 chars — overflows old format).
+        lcCycleId = `pacy_${crypto.randomUUID()}`;
+        record('long-cycle.fixture-len', lcCycleId.length >= 37, `cycleId=${lcCycleId} (${lcCycleId.length} chars)`);
+
+        // Send cycle.succeeded with that ID — must trigger real Shopify order
+        const res = await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_lc_${Date.now()}`,
+            event: 'recurring.cycle.succeeded',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: {
+              id: lcCycleId,
+              recurring_plan_id: sub.xendit_plan_id,
+              amount: 99000,
+              currency: 'IDR',
+              cycle_date: new Date().toISOString(),
+              payment_method: { type: 'CARD' },
+              payment_id: 'pay_qa_lc',
+            },
+          }),
+        });
+        const body = await res.json();
+        record('long-cycle.webhook.200', res.status === 200 && body.ok === true, `body=${JSON.stringify(body)}`);
+
+        const { data: inv } = await supabase
+          .from('subscription_invoices')
+          .select('status, shopify_sync_status, shopify_order_id, shopify_sync_error')
+          .eq('xendit_cycle_id', lcCycleId)
+          .single();
+        record(
+          'long-cycle.shopify-order-created',
+          inv?.shopify_sync_status === 'SYNCED' && inv?.shopify_order_id != null,
+          `sync=${inv?.shopify_sync_status} order=${inv?.shopify_order_id} err=${(inv?.shopify_sync_error ?? '').slice(0, 100)}`,
+        );
+
+        // Re-send same cycle.succeeded with same ID — must NOT create duplicate order
+        const res2 = await fetch(`${APP_URL}/api/webhook/xendit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-callback-token': WEBHOOK_TOKEN },
+          body: JSON.stringify({
+            id: `evt_qa_lc_dup_${Date.now()}`,
+            event: 'recurring.cycle.succeeded',
+            created: new Date().toISOString(),
+            business_id: 'qa',
+            data: {
+              id: lcCycleId,
+              recurring_plan_id: sub.xendit_plan_id,
+              amount: 99000,
+              currency: 'IDR',
+              payment_method: { type: 'CARD' },
+            },
+          }),
+        });
+        const body2 = await res2.json();
+        record('long-cycle.idempotent.200', res2.status === 200 && body2.ok === true, `body=${JSON.stringify(body2)}`);
+        // Should still be exactly one Shopify order for this customer
+        const ordersRes = await shopifyAdmin(`/customers/${lcId}/orders.json?status=any&limit=10`, {});
+        const orderCount = ordersRes.body?.orders?.length ?? 0;
+        record('long-cycle.idempotent.no-dup-order', orderCount === 1, `order_count=${orderCount}`);
+      }
+    }
+  } finally {
+    if (lcSub?.xendit_plan_id && !lcSub.xendit_plan_id.startsWith('pending-')) {
+      try {
+        await xenditApi(`/recurring/plans/${lcSub.xendit_plan_id}/deactivate`, { method: 'POST' });
+      } catch {}
+    }
+    if (lcId) {
+      const ordersRes = await shopifyAdmin(`/customers/${lcId}/orders.json?status=any&limit=50`, {});
+      for (const o of ordersRes.body?.orders ?? []) {
+        await shopifyAdmin(`/orders/${o.id}.json`, { method: 'DELETE' });
+      }
+    }
+    if (lcSub?.id) {
+      await supabase.from('subscription_invoices').delete().eq('subscription_id', lcSub.id);
+      await supabase.from('subscriptions').delete().eq('id', lcSub.id);
+    }
+    if (lcId) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const d = await shopifyAdmin(`/customers/${lcId}.json`, { method: 'DELETE' });
+        if (d.status === 200) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+}
+
+// =================================================================
+// SECTION 12: Subscribe per-customer rate-limit (5 burst → 6th = 429)
+// Uses a fake customer-id (passes signature) with a bogus plan code so
+// each allowed request returns 400 quickly; the 6th hits the empty bucket.
+// =================================================================
+{
+  const fakeRateId = String(99000000 + Math.floor(Math.random() * 999999));
+  const statuses = [];
+  for (let i = 0; i < 6; i += 1) {
+    const u = buildSignedUrl(
+      '/api/subscribe',
+      { plan_code: 'qa-bogus-plan-rate-limit' },
+      fakeRateId,
+    );
+    const r = await fetch(u, { redirect: 'manual' });
+    statuses.push(r.status);
+  }
+  const last = statuses[statuses.length - 1];
+  const firstFive = statuses.slice(0, 5);
+  record(
+    'subscribe.rate-limit.6th-429',
+    last === 429 && firstFive.every((s) => s !== 429),
+    `statuses=${statuses.join(',')}`,
+  );
+  // Cleanup bucket immediately so re-runs aren't sticky
+  await supabase
+    .from('rate_limit_counters')
+    .delete()
+    .eq('bucket_key', `subscribe:${fakeRateId}`);
+}
+
+// =================================================================
 // CLEANUP
 // =================================================================
 if (xenditPlanIdForCleanup) {
