@@ -14,7 +14,7 @@ import { log } from './logger';
 export type AuditEntry = {
   action: string;
   actor: 'system' | 'cron' | 'admin' | 'shopify' | 'xendit';
-  targetType?: 'subscription' | 'invoice' | 'webhook_event' | 'customer';
+  targetType?: 'subscription' | 'invoice' | 'webhook_event' | 'customer' | 'checkout_order';
   targetId?: string;
   details?: Record<string, unknown>;
   requestId?: string;

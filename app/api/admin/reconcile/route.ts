@@ -48,6 +48,19 @@ export async function GET(req: Request) {
     .in('shopify_sync_status', ['PENDING', 'FAILED'])
     .eq('status', 'SUCCEEDED');
 
+  const { count: pendingCheckoutOrders } = await admin
+    .from('checkout_orders')
+    .select('id', { count: 'exact', head: true })
+    .in('shopify_sync_status', ['PENDING', 'FAILED'])
+    .eq('status', 'PAID');
+
+  const { count: pendingPlanAmountFix } = await admin
+    .from('subscriptions')
+    .select('id', { count: 'exact', head: true })
+    .eq('cart_type', 'MIXED')
+    .eq('amount_adjusted', false)
+    .eq('status', 'ACTIVE');
+
   const { count: failedTags } = await admin
     .from('subscriptions')
     .select('id', { count: 'exact', head: true })
@@ -65,6 +78,8 @@ export async function GET(req: Request) {
 
   return NextResponse.json({
     invoices_needing_sync: pendingInvoices ?? 0,
+    checkout_orders_needing_sync: pendingCheckoutOrders ?? 0,
+    subscriptions_pending_plan_amount_fix: pendingPlanAmountFix ?? 0,
     subscriptions_with_failed_tag: failedTags ?? 0,
     stale_reservations: staleReservations ?? 0,
   });

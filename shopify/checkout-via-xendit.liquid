@@ -1,0 +1,143 @@
+{% comment %}
+  Snippet: checkout-via-xendit
+
+  Reference implementation for the new cart-based Xendit checkout.
+  Posts the current /cart.js contents to /apps/xendit/checkout and
+  redirects the customer to the Xendit hosted checkout URL it returns.
+
+  The button auto-detects login state and cart contents:
+    - Not logged in           → routes to /account/login
+    - Empty cart              → disabled
+    - Cart present            → POSTs cart to backend, redirects to Xendit
+
+  Wire-up is up to the theme team. Typical placements:
+    - Cart drawer footer (replace or sit alongside the native CHECK OUT)
+    - Cart page primary CTA
+    - Conditionally rendered when cart contains subscription items
+
+  Usage:
+    {% render 'checkout-via-xendit', label: 'Checkout with Xendit' %}
+{% endcomment %}
+
+{% assign label = label | default: 'Checkout with Xendit' %}
+{% assign proxy_path = '/apps/xendit/checkout' %}
+
+{% if customer %}
+  <button
+    type="button"
+    class="btn btn--primary xendit-checkout-btn"
+    data-xendit-checkout
+    data-endpoint="{{ proxy_path }}"
+  >
+    <span data-xendit-label>{{ label }}</span>
+    <span data-xendit-spinner hidden>Processing…</span>
+  </button>
+  <p class="xendit-checkout-error" data-xendit-error hidden></p>
+{% else %}
+  <a
+    href="/account/login?return_url={{ request.path | url_encode }}"
+    class="btn btn--primary xendit-checkout-btn"
+  >
+    Login untuk Checkout
+  </a>
+{% endif %}
+
+<script>
+  (function () {
+    const btn = document.querySelector('[data-xendit-checkout]');
+    if (!btn) return;
+
+    const labelEl = btn.querySelector('[data-xendit-label]');
+    const spinnerEl = btn.querySelector('[data-xendit-spinner]');
+    const errorEl = document.querySelector('[data-xendit-error]');
+    const endpoint = btn.dataset.endpoint;
+
+    const setLoading = (loading) => {
+      btn.disabled = loading;
+      if (labelEl) labelEl.hidden = loading;
+      if (spinnerEl) spinnerEl.hidden = !loading;
+    };
+
+    const showError = (message) => {
+      if (!errorEl) return;
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    };
+
+    const hideError = () => {
+      if (!errorEl) return;
+      errorEl.hidden = true;
+      errorEl.textContent = '';
+    };
+
+    btn.addEventListener('click', async () => {
+      hideError();
+      setLoading(true);
+      try {
+        // Read live cart from Shopify AJAX API.
+        const cartRes = await fetch('/cart.js', { credentials: 'same-origin' });
+        if (!cartRes.ok) throw new Error('Failed to load cart');
+        const cart = await cartRes.json();
+
+        if (!cart.items || cart.items.length === 0) {
+          showError('Cart is empty.');
+          setLoading(false);
+          return;
+        }
+
+        // Map /cart.js shape → backend payload.
+        // selling_plan_allocation.selling_plan.id present = subscription line.
+        const lineItems = cart.items.map((it) => ({
+          variant_id: String(it.variant_id),
+          quantity: it.quantity,
+          selling_plan_id:
+            it.selling_plan_allocation && it.selling_plan_allocation.selling_plan
+              ? String(it.selling_plan_allocation.selling_plan.id)
+              : null,
+        }));
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ line_items: lineItems }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          if (res.status === 401 && data.login_url) {
+            window.location.assign(data.login_url);
+            return;
+          }
+          if (res.status === 409 && data.code === 'DUPLICATE_SUBSCRIPTION') {
+            window.location.assign('/account');
+            return;
+          }
+          showError(data.error || 'Checkout failed. Please try again.');
+          setLoading(false);
+          return;
+        }
+
+        if (!data.redirect_url) {
+          showError('No checkout URL returned. Please try again.');
+          setLoading(false);
+          return;
+        }
+
+        // Hard-navigate to Xendit hosted checkout.
+        window.location.assign(data.redirect_url);
+      } catch (err) {
+        showError((err && err.message) || 'Unexpected error.');
+        setLoading(false);
+      }
+    });
+  })();
+</script>
+
+<style>
+  .xendit-checkout-btn { display: inline-block; padding: 12px 24px;
+    border-radius: 8px; font-weight: 600; cursor: pointer; }
+  .xendit-checkout-btn[disabled] { opacity: 0.7; cursor: wait; }
+  .xendit-checkout-error { color: #b00020; margin-top: 8px; font-size: 14px; }
+</style>

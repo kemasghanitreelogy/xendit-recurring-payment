@@ -105,6 +105,15 @@ export type RecurringPlan = {
   };
 };
 
+export type RecurringPlanItem = {
+  type?: 'PRODUCT' | 'SERVICE' | 'DELIVERY' | 'DIGITAL_PRODUCT' | 'FEE' | 'DISCOUNT';
+  name: string;
+  net_unit_amount: number;
+  quantity: number;
+  url?: string;
+  description?: string;
+};
+
 export async function createRecurringPlan(input: {
   customerId: string;
   referenceId: string;
@@ -117,6 +126,8 @@ export async function createRecurringPlan(input: {
   failureUrl: string;
   anchorDate?: Date;
   trialDays?: number;
+  items?: RecurringPlanItem[];
+  metadata?: Record<string, string>;
 }): Promise<RecurringPlan> {
   // Clone so we never mutate caller's Date.
   const anchorDate = new Date(input.anchorDate ?? Date.now());
@@ -152,10 +163,33 @@ export async function createRecurringPlan(input: {
       success_return_url: input.successUrl,
       failure_return_url: input.failureUrl,
       description: input.description,
+      items: input.items,
       metadata: {
         source: 'nextjs-app',
+        ...(input.metadata ?? {}),
       },
     }),
+  });
+}
+
+/**
+ * Mutate the per-cycle charge amount on a live Xendit Recurring Plan.
+ *
+ * Used by the MIXED-cart flow: cycle 1 charges (subscription + one-time
+ * addon) so the customer pays for everything in their cart with a single
+ * card capture; after `recurring.cycle.succeeded` for that first cycle,
+ * we PATCH the plan down to the subscription-only amount so cycles 2+
+ * bill the recurring price the customer signed up for.
+ *
+ * Safe to retry — Xendit treats this as idempotent state.
+ */
+export async function updateRecurringPlanAmount(
+  planId: string,
+  amount: number,
+): Promise<RecurringPlan> {
+  return xenditFetch<RecurringPlan>(`/recurring/plans/${planId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ amount }),
   });
 }
 
@@ -179,4 +213,72 @@ export async function resumeRecurringPlan(planId: string) {
   return xenditFetch<RecurringPlan>(`/recurring/plans/${planId}/resume`, {
     method: 'POST',
   });
+}
+
+// ============================================================
+// INVOICE (one-time hosted checkout)
+// ============================================================
+
+export type XenditInvoice = {
+  id: string;
+  external_id: string;
+  user_id: string;
+  status: 'PENDING' | 'PAID' | 'SETTLED' | 'EXPIRED';
+  amount: number;
+  currency: string;
+  invoice_url: string;
+  expiry_date: string;
+  payer_email?: string;
+  description?: string;
+  customer?: { id?: string; email?: string };
+  paid_at?: string;
+  payment_method?: string;
+  payment_channel?: string;
+};
+
+export type XenditInvoiceItem = {
+  name: string;
+  quantity: number;
+  price: number;
+  category?: string;
+  url?: string;
+};
+
+export async function createInvoice(input: {
+  externalId: string;
+  customerId?: string;
+  amount: number;
+  currency?: string;
+  description: string;
+  payerEmail: string;
+  successUrl: string;
+  failureUrl: string;
+  expirySeconds?: number;
+  items?: XenditInvoiceItem[];
+  metadata?: Record<string, string>;
+}): Promise<XenditInvoice> {
+  // Invoice API lives at /v2/invoices (separate from /recurring/plans).
+  return xenditFetch<XenditInvoice>('/v2/invoices', {
+    method: 'POST',
+    body: JSON.stringify({
+      external_id: input.externalId,
+      amount: input.amount,
+      currency: input.currency ?? 'IDR',
+      description: input.description,
+      payer_email: input.payerEmail,
+      customer_id: input.customerId,
+      success_redirect_url: input.successUrl,
+      failure_redirect_url: input.failureUrl,
+      invoice_duration: input.expirySeconds ?? 24 * 60 * 60,
+      items: input.items,
+      metadata: {
+        source: 'nextjs-app',
+        ...(input.metadata ?? {}),
+      },
+    }),
+  });
+}
+
+export async function getInvoice(invoiceId: string): Promise<XenditInvoice> {
+  return xenditFetch<XenditInvoice>(`/v2/invoices/${invoiceId}`);
 }
