@@ -368,7 +368,7 @@ async function handleSubscription(
       successUrl: `${appUrl}/billing/success?type=${cartType.toLowerCase()}&ref=${referenceId}`,
       failureUrl: `${appUrl}/billing/failed?type=${cartType.toLowerCase()}&ref=${referenceId}`,
       items: cart.lineItems.map((li) => ({
-        type: 'PRODUCT',
+        type: 'PHYSICAL_PRODUCT',
         name: li.title,
         net_unit_amount: li.unitPrice,
         quantity: li.quantity,

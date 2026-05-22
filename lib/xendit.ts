@@ -106,7 +106,7 @@ export type RecurringPlan = {
 };
 
 export type RecurringPlanItem = {
-  type?: 'PRODUCT' | 'SERVICE' | 'DELIVERY' | 'DIGITAL_PRODUCT' | 'FEE' | 'DISCOUNT';
+  type?: 'DIGITAL_PRODUCT' | 'PHYSICAL_PRODUCT' | 'DIGITAL_SERVICE' | 'PHYSICAL_SERVICE' | 'FEES' | 'DISCOUNT';
   name: string;
   net_unit_amount: number;
   quantity: number;
