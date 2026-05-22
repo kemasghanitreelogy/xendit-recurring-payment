@@ -135,7 +135,7 @@ export async function getVariantsByIds(variantIds: string[]): Promise<ShopifyVar
     title: string;
     price: string;
     sku: string | null;
-    requiresShipping: boolean;
+    inventoryItem: { requiresShipping: boolean } | null;
     taxable: boolean;
     image: { url: string } | null;
     product: { id: string; title: string };
@@ -159,7 +159,7 @@ export async function getVariantsByIds(variantIds: string[]): Promise<ShopifyVar
           title
           price
           sku
-          requiresShipping
+          inventoryItem { requiresShipping }
           taxable
           image { url }
           product { id title }
@@ -199,7 +199,7 @@ export async function getVariantsByIds(variantIds: string[]): Promise<ShopifyVar
       currencyCode: data.shop.currencyCode,
       hasSellingPlans: sellingPlanIds.length > 0,
       sellingPlanIds,
-      requiresShipping: node.requiresShipping,
+      requiresShipping: node.inventoryItem?.requiresShipping ?? true,
       taxable: node.taxable,
       imageUrl: node.image?.url ?? null,
     });
