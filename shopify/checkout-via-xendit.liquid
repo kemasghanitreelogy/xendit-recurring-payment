@@ -114,6 +114,12 @@
             window.location.assign('/account');
             return;
           }
+          // Pure one-time cart — backend told us to use Shopify's native
+          // checkout instead of the Xendit recurring flow.
+          if (data.code === 'USE_NATIVE_CHECKOUT') {
+            window.location.assign(data.native_checkout_path || '/checkout');
+            return;
+          }
           showError(data.error || 'Checkout failed. Please try again.');
           setLoading(false);
           return;

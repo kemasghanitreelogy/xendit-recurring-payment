@@ -698,7 +698,20 @@ async function mutatePlanAmountIfNeeded(
 }
 
 // ============================================================
-// INVOICE EVENTS (one-time `checkout_orders` path)
+// INVOICE EVENTS (one-time `checkout_orders` path) — DORMANT
+//
+// As of 2026-05-22 this code path is NOT exercised in production:
+// the store's `invoice.paid` webhook in Xendit is wired to a different
+// backend (api.treelogy.com), and PURE_ONETIME carts at /api/checkout
+// are deliberately redirected to Shopify's native checkout (see the
+// USE_NATIVE_CHECKOUT branch in app/api/checkout/route.ts).
+//
+// The handler + the `checkout_orders` table are kept as plumbing for
+// a future split where invoices created by THIS backend (e.g. via a
+// separate Xendit sub-account) could be webhooked back here. If that
+// never happens, this whole block — plus the checkout_orders table —
+// can be deleted in a follow-up migration. Until then it is dead but
+// type-safe and tested code.
 // ============================================================
 
 type CheckoutOrderRow = {

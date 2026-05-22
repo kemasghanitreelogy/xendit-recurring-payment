@@ -3,7 +3,6 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import {
   createOrGetCustomer,
   createRecurringPlan,
-  createInvoice,
   deactivateRecurringPlan,
   XenditError,
 } from '@/lib/xendit';
@@ -37,13 +36,21 @@ export const maxDuration = 30;
  * selling-plan claim is validated against the Shopify Admin API before
  * any Xendit object is created.
  *
- * Branches by cart type:
- *   PURE_ONETIME      → Xendit Invoice (single charge)        → checkout_orders
- *   PURE_SUBSCRIPTION → Xendit Recurring Plan (sub_total)      → subscriptions
+ * Currently supported cart types:
+ *   PURE_SUBSCRIPTION → Xendit Recurring Plan (sub_total)     → subscriptions
  *   MIXED             → Xendit Recurring Plan
  *                       cycle 1 amount = sub + onetime
  *                       cycle 2+       = sub only (PATCHed after cycle 1 webhook)
- *                                                              → subscriptions
+ *                                                             → subscriptions
+ *
+ * Pure-one-time carts are deliberately rejected with `USE_NATIVE_CHECKOUT`
+ * so the theme can fall back to Shopify's native checkout. Reason: the
+ * Xendit invoice webhook URL at this store is already wired to a different
+ * backend (api.treelogy.com), and Xendit allows only one URL per event
+ * type. Adding a second invoice consumer here would clash with that
+ * existing integration, and one-time payments don't need recurring
+ * primitives anyway. The invoice handler in /api/webhook/xendit and the
+ * checkout_orders table are kept as dormant code for a future split.
  *
  * Response: 200 JSON { redirect_url: "https://checkout.xendit.co/..." }.
  * The theme reads `redirect_url` and `window.location.assign()`s it.
@@ -117,6 +124,25 @@ export async function POST(req: Request) {
     );
   }
   const cart = validation.cart;
+
+  // 4a. Pure one-time carts route to native Shopify checkout — see the file
+  //     header for why. We fail FAST here, before any Xendit calls, so the
+  //     theme can redirect without latency.
+  if (cart.type === 'PURE_ONETIME') {
+    log.info('checkout.pure_onetime_redirect_to_native', {
+      shopifyCustomerId: ctx.shopifyCustomerId,
+      itemCount: cart.lineItems.length,
+      grandTotal: cart.grandTotal,
+    });
+    return NextResponse.json(
+      {
+        error: 'One-time carts use Shopify native checkout',
+        code: 'USE_NATIVE_CHECKOUT',
+        native_checkout_path: '/checkout',
+      },
+      { status: 400 },
+    );
+  }
 
   // 5. For carts with subscription items, fetch all selling plans and
   //    enforce a uniform billing interval (Xendit Recurring = one schedule
@@ -213,24 +239,13 @@ export async function POST(req: Request) {
     shop_domain: shopDomain,
   };
 
-  // 8. Dispatch by cart type.
+  // 8. Dispatch — only reachable for PURE_SUBSCRIPTION and MIXED. PURE_ONETIME
+  //    was redirected to native checkout above, so recurringSchedule must be set.
+  if (!recurringSchedule) {
+    return NextResponse.json({ error: 'Internal cart classification error' }, { status: 500 });
+  }
+
   try {
-    if (cart.type === 'PURE_ONETIME') {
-      return await handleOneTime(supabase, {
-        shopifyCustomer,
-        ctx,
-        xenditCustomer,
-        cart,
-        cartSnapshot,
-        appUrl,
-      });
-    }
-
-    if (!recurringSchedule) {
-      // Defensive: should be impossible given the branches above.
-      return NextResponse.json({ error: 'Internal cart classification error' }, { status: 500 });
-    }
-
     return await handleSubscription(supabase, {
       shopifyCustomer,
       ctx,
@@ -256,82 +271,10 @@ export async function POST(req: Request) {
 }
 
 // ============================================================
-// PURE_ONETIME — Xendit Invoice
+// PURE_SUBSCRIPTION + MIXED — Xendit Recurring Plan
 // ============================================================
 
 type SupabaseAdmin = ReturnType<typeof createAdminClient>;
-
-async function handleOneTime(
-  supabase: SupabaseAdmin,
-  args: {
-    shopifyCustomer: Awaited<ReturnType<typeof getCustomer>>;
-    ctx: NonNullable<ReturnType<typeof verifyAppProxy>>;
-    xenditCustomer: Awaited<ReturnType<typeof createOrGetCustomer>>;
-    cart: ValidatedCart;
-    cartSnapshot: Record<string, unknown>;
-    appUrl: string;
-  },
-): Promise<NextResponse> {
-  const { shopifyCustomer, ctx, xenditCustomer, cart, cartSnapshot, appUrl } = args;
-  const referenceId = `co-${ctx.shopifyCustomerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  const invoice = await createInvoice({
-    externalId: referenceId,
-    customerId: xenditCustomer.id,
-    amount: cart.grandTotal,
-    currency: cart.currency,
-    description: `Order ${referenceId}`,
-    payerEmail: shopifyCustomer.email,
-    successUrl: `${appUrl}/billing/success?type=onetime&ref=${referenceId}`,
-    failureUrl: `${appUrl}/billing/failed?type=onetime&ref=${referenceId}`,
-    items: cart.lineItems.map((li) => ({
-      name: li.title,
-      quantity: li.quantity,
-      price: li.unitPrice,
-      url: li.imageUrl ?? undefined,
-    })),
-    metadata: {
-      shopify_customer_id: ctx.shopifyCustomerId!,
-      cart_type: 'PURE_ONETIME',
-    },
-  });
-
-  const { error: insertErr } = await supabase.from('checkout_orders').insert({
-    shopify_customer_id: ctx.shopifyCustomerId,
-    shopify_customer_email: shopifyCustomer.email,
-    shopify_customer_name:
-      [shopifyCustomer.first_name, shopifyCustomer.last_name].filter(Boolean).join(' ') || null,
-    xendit_customer_id: xenditCustomer.id,
-    xendit_invoice_id: invoice.id,
-    xendit_reference_id: referenceId,
-    amount: cart.grandTotal,
-    currency: cart.currency,
-    status: 'PENDING',
-    cart_snapshot: cartSnapshot,
-  });
-
-  if (insertErr) {
-    // Couldn't persist — best-effort don't leave an orphan invoice charging
-    // a customer with no DB row to reconcile against. The invoice will
-    // simply expire (default 24h) since there's no way to "cancel" a
-    // PENDING Xendit invoice from the API.
-    log.error('checkout.checkout_orders_insert_failed', {
-      error: insertErr.message,
-      invoiceId: invoice.id,
-    });
-    return NextResponse.json({ error: 'Failed to save order' }, { status: 500 });
-  }
-
-  return NextResponse.json({
-    redirect_url: invoice.invoice_url,
-    xendit_invoice_id: invoice.id,
-    type: 'onetime',
-  });
-}
-
-// ============================================================
-// PURE_SUBSCRIPTION + MIXED — Xendit Recurring Plan
-// ============================================================
 
 async function handleSubscription(
   supabase: SupabaseAdmin,
